@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: line-frontend-customer-service
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
