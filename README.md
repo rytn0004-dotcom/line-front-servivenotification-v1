@@ -1,8 +1,13 @@
-# LINE Frontend / Customer Service V1.1
+# LINE Frontend / Customer Service V1.2
 
 用途：LINE Webhook、家長／老師綁定、關鍵詞「選單」喚醒、課程查詢／繳費／客服入口，以及既有 AI 額度控制資料結構。
 
-本服務不負責：固定課表、調課課程、實際課表產生；也不負責課程提醒排程。
+本版修正：
+- 「選單」後輸入 `1` 會正確進入 LINE 綁定流程。
+- `1 / 綁定 / 開始綁定 / 重新綁定` 都會啟動綁定。
+- 選單 `2` 課程查詢、`3` 繳費／收據：目前功能未啟用，統一回覆「請諮詢人工客服」。
+- `4` 人工客服可正常進入。
+- 一般非喚醒訊息仍維持不自動回覆。
 
 ## Render
 - Build Command: `npm install`
@@ -16,6 +21,3 @@
 - `GOOGLE_SERVICE_ACCOUNT_JSON`
 
 不要把 JSON 金鑰、Channel Secret 或 Access Token 上傳到 GitHub。
-
-## Google Sheets
-沿用既有 Google Service Account 與 Google Sheet。前台功能主要讀寫「聯絡人」「Webhook紀錄」「AI額度管理」「系統設定」等資料。

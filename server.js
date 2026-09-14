@@ -220,8 +220,23 @@ app.post('/webhook',async(req,res)=>{
       if(text===kw||text==='功能選單'){await saveInteraction(s,uid,'互動模式',nowTaipei(),futureTaipei(minutes));if(event.replyToken)await lineReply(event.replyToken,menu(minutes));return;}
       if(text==='取消'||text==='取消互動'){await saveInteraction(s,uid,'安靜模式','','');await saveBinding(s,uid,'WAIT_ROLE',{});if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。一般訊息不會自動回覆；如需服務，請輸入「選單」。');return;}
 
+      // Menu options must be handled BEFORE binding-state processing.
+      // Otherwise a fresh user in WAIT_ROLE would send "1" and get no reply.
+      if(mode==='關閉')return;
+      if(mode==='關鍵詞喚醒'&&!awake(s,uid))return;
+
+      if(text==='1'||text==='LINE綁定'||text==='綁定'||text==='開始綁定'||text==='重新綁定'){
+        await saveBinding(s,uid,'WAIT_ROLE',{});
+        await saveInteraction(s,uid,'互動模式',nowTaipei(),futureTaipei(minutes));
+        if(event.replyToken)await lineReply(event.replyToken,'好的，開始 LINE 綁定。\n\n請先輸入您的身分：\n「家長」或「老師」\n\n這不需要提供學生姓名。');
+        return;
+      }
+
+      if(text==='2'||text==='課程查詢'){if(event.replyToken)await lineReply(event.replyToken,'目前課程查詢服務尚未啟用，請諮詢人工客服。');return;}
+      if(text==='3'||text==='繳費／收據'||text==='繳費/收據'){if(event.replyToken)await lineReply(event.replyToken,'目前繳費／收據服務尚未啟用，請諮詢人工客服。');return;}
+      if(text==='4'||text==='人工客服'){if(event.replyToken)await lineReply(event.replyToken,'已進入人工客服服務，請直接留言。');return;}
+
       const state=findBinding(s,uid), status=state?.status||'WAIT_ROLE';
-      if(['綁定','開始綁定','重新綁定'].includes(text)){await saveBinding(s,uid,'WAIT_ROLE',{});await saveInteraction(s,uid,'互動模式',nowTaipei(),futureTaipei(minutes));if(event.replyToken)await lineReply(event.replyToken,welcome(kw));return;}
 
       if(status==='WAIT_ROLE'){
         if(text==='家長'){await saveBinding(s,uid,'WAIT_PARENT_STUDENT_NAMES',{role:'家長'});if(event.replyToken)await lineReply(event.replyToken,parentPrompt());return;}
@@ -253,12 +268,7 @@ app.post('/webhook',async(req,res)=>{
         return;
       }
 
-      if(mode==='關閉')return;
-      if(mode==='關鍵詞喚醒'&&!awake(s,uid))return;
-      if(text==='1'||text==='LINE綁定'){await saveBinding(s,uid,'WAIT_ROLE',{});if(event.replyToken)await lineReply(event.replyToken,welcome(kw));return;}
-      if(text==='2'||text==='課程查詢'){if(event.replyToken)await lineReply(event.replyToken,'課程查詢入口已開啟，功能接線中。');return;}
-      if(text==='3'||text==='繳費／收據'||text==='繳費/收據'){if(event.replyToken)await lineReply(event.replyToken,'繳費／收據入口已開啟，功能接線中。');return;}
-      if(text==='4'||text==='人工客服'){if(event.replyToken)await lineReply(event.replyToken,'已進入人工客服服務，請直接留言。');return;}
+      // All numeric menu commands are handled above once the user is awake.
     }).catch(err=>console.error('Webhook event error:',err)).finally(()=>{release();if(cache.locks.get(uid)===current)cache.locks.delete(uid);});
   }
 });
