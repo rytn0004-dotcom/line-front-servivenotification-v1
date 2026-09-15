@@ -56,6 +56,24 @@ async function retry(label,fn){
   } throw last;
 }
 
+function detectHeaderRow(rows, required){
+  const need=(required||[]).map(String);
+  for(let i=0;i<(rows||[]).length;i++){
+    const set=new Set((rows[i]||[]).map(x=>String(x).trim()));
+    if(need.every(x=>set.has(x))) return i;
+  }
+  return -1;
+}
+
+function detectHeaderRow(rows, required){
+  const need=(required||[]).map(String);
+  for(let i=0;i<(rows||[]).length;i++){
+    const set=new Set((rows[i]||[]).map(x=>String(x).trim()));
+    if(need.every(x=>set.has(x))) return i;
+  }
+  return -1;
+}
+
 async function readSnapshot(force=false){
   if(!force && cache.snapshot && cache.expiresAt>Date.now()) return cache.snapshot;
   if(cache.inFlight) return cache.inFlight;
@@ -67,11 +85,15 @@ async function readSnapshot(force=false){
       `${esc('系統設定')}!A:D`,
     ];
     const r=await sheets.spreadsheets.values.batchGet({spreadsheetId:SHEET_ID,ranges,majorDimension:'ROWS'});
+    const contacts=r.data.valueRanges?.[0]?.values||[];
+    const settings=r.data.valueRanges?.[3]?.values||[];
     return {
-      contacts:r.data.valueRanges?.[0]?.values||[],
+      contacts,
+      contactsHeaderRow:detectHeaderRow(contacts,['姓名','身分','LINE User ID']),
       bindings:r.data.valueRanges?.[1]?.values||[],
       interactions:r.data.valueRanges?.[2]?.values||[],
-      settings:r.data.valueRanges?.[3]?.values||[],
+      settings,
+      settingsHeaderRow:detectHeaderRow(settings,['設定項目','目前值'])
     };
   }).then(s=>{cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;cache.inFlight=null;return s;})
     .catch(e=>{cache.inFlight=null;throw e;});
@@ -139,7 +161,7 @@ function sigOK(req){
   try{return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(digest));}catch{return false;}
 }
 
-function settingsMap(s){const o={};for(const r of (s.settings||[]).slice(2))if(r[0])o[String(r[0])]=String(r[1]||'');return o;}
+function settingsMap(s){const rows=s.settings||[];const hi=Number.isInteger(s.settingsHeaderRow)&&s.settingsHeaderRow>=0?s.settingsHeaderRow:detectHeaderRow(rows,['設定項目','目前值']);const o={};for(let i=hi+1;i<rows.length;i++){const r=rows[i]||[];if(r[0])o[String(r[0])]=String(r[1]||'');}return o;}
 function findBinding(s,uid){
   for(let i=1;i<(s.bindings||[]).length;i++){const r=s.bindings[i]||[];if(norm(r[0])===norm(uid)){let d={};try{d=JSON.parse(r[2]||'{}')}catch{}return {row:i+1,status:r[1]||'',data:d};}}
   return null;
@@ -163,26 +185,19 @@ async function saveInteraction(s,uid,mode,wake,expire){
   cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
 }
 async function upsertContact(s,{uid,role,lineName,enteredName,students}){
-  const rows=s.contacts||[];if(!rows.length)throw new Error('聯絡人工作表沒有標題列。');
-  let headers=rows[0].map(String);
-  const idx={
-    name:headers.indexOf('姓名'),role:headers.indexOf('身分'),
-    student:headers.indexOf('學生姓名/關聯（可多位）')>=0?headers.indexOf('學生姓名/關聯（可多位）'):headers.indexOf('學生姓名/關聯'),
-    line:headers.indexOf('LINE User ID'),status:headers.indexOf('綁定狀態'),
-    time:headers.indexOf('最後綁定時間'),active:headers.indexOf('通知啟用')>=0?headers.indexOf('通知啟用'):headers.indexOf('啟用')
-  };
+  const rows=s.contacts||[];
+  const headerRow=Number.isInteger(s.contactsHeaderRow)?s.contactsHeaderRow:detectHeaderRow(rows,['姓名','身分','LINE User ID']);
+  if(headerRow<0)throw new Error('聯絡人工作表找不到欄位標題列。請確認至少包含：姓名、身分、LINE User ID。');
+  const headers=(rows[headerRow]||[]).map(String);
+  const idx={name:headers.indexOf('姓名'),role:headers.indexOf('身分'),student:headers.indexOf('學生姓名/關聯（可多位）')>=0?headers.indexOf('學生姓名/關聯（可多位）'):headers.indexOf('學生姓名/關聯'),line:headers.indexOf('LINE User ID'),status:headers.indexOf('綁定狀態'),time:headers.indexOf('最後綁定時間'),active:headers.indexOf('通知啟用')>=0?headers.indexOf('通知啟用'):headers.indexOf('啟用')};
   const missing=[];for(const [k,title] of [['name','姓名'],['role','身分'],['student','學生姓名/關聯'],['line','LINE User ID'],['status','綁定狀態'],['time','最後綁定時間']])if(idx[k]<0)missing.push(title);
-  if(missing.length){
-    await update('聯絡人',`${col(headers.length+1)}1:${col(headers.length+missing.length)}1`,[missing]);
-    cache.snapshot=null;return upsertContact(await readSnapshot(true),{uid,role,lineName,enteredName,students});
-  }
-  let rowNo=null;for(let i=1;i<rows.length;i++)if(norm(rows[i]?.[idx.line])===norm(uid)){rowNo=i+1;break;}
+  if(missing.length)throw new Error(`聯絡人標題列缺少欄位：${missing.join('、')}`);
+  let rowNo=null;for(let i=headerRow+1;i<rows.length;i++)if(norm(rows[i]?.[idx.line])===norm(uid)){rowNo=i+1;break;}
   const width=Math.max(headers.length,9), row=Array(width).fill('');
-  row[idx.name]=lineName||'';row[idx.role]=role;row[idx.student]=role==='老師'?(enteredName||''):uniq(students||[]).join('、');
-  row[idx.line]=uid;row[idx.status]='已綁定';row[idx.time]=nowTaipei();if(idx.active>=0)row[idx.active]='是';
-  if(rowNo){const old=rows[rowNo-1]||[];for(let i=0;i<row.length;i++)if(!row[i])row[i]=old[i]||'';await update('聯絡人',`A${rowNo}:${col(row.length)}${rowNo}`,[row]);rows[rowNo-1]=row;}
-  else{await appendRows('聯絡人',[row]);rows.push(row);}
-  s.contacts=rows;cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
+  const source=rowNo?(rows[rowNo-1]||[]):[];for(let i=0;i<Math.min(source.length,width);i++)row[i]=source[i]||'';
+  row[idx.name]=lineName||row[idx.name]||'';row[idx.role]=role;row[idx.student]=role==='老師'?(enteredName||row[idx.student]||''):uniq(students||[]).join('、');row[idx.line]=uid;row[idx.status]='已綁定';row[idx.time]=nowTaipei();if(idx.active>=0)row[idx.active]='是';
+  if(rowNo){await update('聯絡人',`A${rowNo}:${col(row.length)}${rowNo}`,[row]);rows[rowNo-1]=row;}else{await appendRows('聯絡人',[row]);rows.push(row);}
+  s.contacts=rows;s.contactsHeaderRow=headerRow;cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
 }
 
 function welcome(keyword){return `您好，歡迎加入！\n\n本官方 LINE 可提供課程提醒、LINE 帳號綁定及相關服務。\n\n如需使用自動服務，請輸入：「${keyword}」\n\n平常留言會先記錄，不會自動回覆。`;}
@@ -250,7 +265,13 @@ app.post('/webhook',async(req,res)=>{
         if(text==='重新輸入'){await saveBinding(s,uid,'WAIT_PARENT_STUDENT_NAMES',{role:'家長'});if(event.replyToken)await lineReply(event.replyToken,parentPrompt());return;}
         if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「重新輸入」。');return;}
         const names=state?.data?.studentNames||[];
-        await upsertContact(s,{uid,role:'家長',lineName,enteredName:'',students:names});
+        try{
+          try{await upsertContact(s,{uid,role:'家長',lineName,enteredName:'',students:names});}catch(e){console.error('Parent binding save error:',e);if(event.replyToken)await lineReply(event.replyToken,'綁定資料寫入失敗，請稍後再試；若持續發生請聯絡管理員。');return;}
+        }catch(e){
+          console.error('Parent binding save error:',e);
+          if(event.replyToken)await lineReply(event.replyToken,'綁定資料寫入失敗，請稍後再試；若持續發生請聯絡管理員。');
+          return;
+        }
         await saveBinding(s,uid,'BOUND',{role:'家長',studentNames:names,personName:lineName});
         if(event.replyToken)await lineReply(event.replyToken,`綁定成功！\n\n學生：${names.join('、')}\nLINE 帳號已完成綁定。`);
         return;
@@ -262,7 +283,13 @@ app.post('/webhook',async(req,res)=>{
         if(text==='重新輸入'){await saveBinding(s,uid,'WAIT_TEACHER_NAME',{role:'老師'});if(event.replyToken)await lineReply(event.replyToken,teacherPrompt());return;}
         if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「重新輸入」。');return;}
         const teacherName=String(state?.data?.teacherName||'').trim();
-        await upsertContact(s,{uid,role:'老師',lineName,enteredName:teacherName,students:[]});
+        try{
+          try{await upsertContact(s,{uid,role:'老師',lineName,enteredName:teacherName,students:[]});}catch(e){console.error('Teacher binding save error:',e);if(event.replyToken)await lineReply(event.replyToken,'綁定資料寫入失敗，請稍後再試；若持續發生請聯絡管理員。');return;}
+        }catch(e){
+          console.error('Teacher binding save error:',e);
+          if(event.replyToken)await lineReply(event.replyToken,'綁定資料寫入失敗，請稍後再試；若持續發生請聯絡管理員。');
+          return;
+        }
         await saveBinding(s,uid,'BOUND',{role:'老師',teacherName});
         if(event.replyToken)await lineReply(event.replyToken,`綁定成功！\n\n老師：${teacherName}\nLINE 帳號已完成綁定。`);
         return;
