@@ -1,57 +1,38 @@
-# LINE 客服系統 V1.9.1｜Gemini＋安全綁定＋AI額度管理
+# LINE 客服 V2.0：AI 多通道自動切換
 
-## 核心功能
-- LINE 選單：1 LINE綁定、2 課程查詢、3 繳費／收據、4 AI客服、5 人工客服。
-- 新好友與選單提示：
-  「主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入『選單』。」
-- 初次綁定：姓名確認後完成綁定；首次最多 3 次重新輸入機會；完成後 3 分鐘內可更正一次。超過反悔期的重新綁定需管理員審核。
-- 課表查詢：只有「聯絡人」中的「課表查詢權限=是」才可使用；後端先依 LINE User ID＋已綁定學生／老師篩選「實際課程」，再交 Gemini 整理。
-- AI客服：一般知識、科技、學習、生活等問題可正常回答；涉及補習班內部資料只能使用後端提供的正式資料。
-- 課表查詢不使用一般 AI 對話記憶；查無資料或資料欄位不存在時不讓 AI 自行猜測。
+## 核心行為
+- Gemini 為主通道。
+- OpenRouter 為可選備援，預設模型 `openrouter/free`。
+- Groq 為可選第二備援，只有同時設定 `GROQ_API_KEY` 與 `GROQ_MODEL` 才啟用。
+- `AI_PROVIDER_ORDER` 可調整順序，例如 `gemini,openrouter,groq`。
+- 同一個使用者問題只預扣 1 次 AI 額度；主通道失敗後切換備援不重複扣額。
+- 所有通道都失敗時，會退還本次 AI 額度，再回傳系統錯誤提示。
+- 課程／學生私有資料預設只送 Gemini；若 Gemini 失敗，改提供後端授權查詢結果，不自動把私有資料送到 OpenRouter/Groq。
+- 如已確認第三方資料政策並希望允許私人資料備援，才在 Render 設定 `AI_PRIVATE_DATA_FALLBACK=true`。
 
-## AI額度管理（本版重點）
-- **不再以 Render 環境變數作為每日 AI 上限的權威來源。** 每日額度由 Google Sheet 的「系統設定」與「AI額度管理」共同控制。
-- 「系統設定」：
-  - AI 聊天功能：是／否
-  - 每人每日基本額度：新使用者／每日換日重置時採用
-  - 全站每日總額度：全站上限
-  - 單次輸入最大字數：超過即拒絕，不呼叫 Gemini
-  - AI 回覆最大 Tokens：直接控制 Gemini `maxOutputTokens`
-  - AI 呼叫冷卻秒數：不足冷卻時間不呼叫 Gemini
-  - AI 對話閒置分鐘數：AI 模式進入及每次成功請求後延長互動時間
-  - 人工客服時停用 AI：人工客服模式不進 AI 路徑
-- 「AI額度管理」：
-  - D 每日基本額度、E 額外次數、F 今日已用、G 剩餘次數=D+E-F、H 額度日期、I 額度操作、J 操作狀態、K 最後使用時間。
-  - D 每次 AI 使用前都同步「系統設定」的「每人每日基本額度」；E 則保留管理員額外加給，因此系統設定一改就立即影響上限。
-  - 每次實際發出 Gemini `generateContent` 請求前就先保留並扣 1 次，避免重試／並行請求繞過上限。
-  - 課程查詢若需要 Gemini 整理，同樣計入 AI 額度；若權限不足、查無課程、或問到課表沒有的欄位，不呼叫 Gemini、不扣 AI 次數。
-  - I 欄可輸入：`+5`、`+10`、`+20`、`+50`、`清除額外次數`、`重置今日用量`；下一次該使用者呼叫 AI 時自動套用。
-  - 全站使用 `LINE User ID = __GLOBAL__` 的一列統計。
+## Render Environment Variables
+必填：
+- `LINE_CHANNEL_SECRET`
+- `LINE_CHANNEL_ACCESS_TOKEN`
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_SERVICE_ACCOUNT_JSON`
 
-## 安全原則
-- LINE webhook 驗證 `X-Line-Signature`。
-- 課表查詢權限由後台「聯絡人」控制，不由使用者輸入名稱自行授權。
-- Gemini 永遠只收到後端已授權的必要資料，不會直接讀整份 Google Sheet。
-- 課表查詢不讀一般 AI 聊天歷史，避免把過去的錯誤答案當成新資料。
+主 AI：
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL=gemini-3.1-flash-lite`
 
-## 標準 Excel 工作表與詞彙
-- 聯絡人：`姓名`、`身分`、`學生姓名/關聯（可多位）`、`LINE User ID`、`綁定狀態`、`最後綁定時間`、`通知啟用`、`備註`、`測試對象`、`課表查詢權限`。
-- 實際課程：`Course ID`、`課程日期`、`星期`、`上課時間`、`學生`、`課程`、`老師`、`校區`、`來源`、`固定課表ID`、`調課ID`、`調課結果`、`備註`。
-- AI額度管理：`LINE User ID`、`LINE 顯示名稱／姓名`、`身分`、`每日基本額度`、`額外次數`、`今日已用`、`剩餘次數`、`額度日期`、`額度操作`、`操作狀態`、`最後使用時間`、`備註`。
-- 程式啟動會檢查上述標準欄位；欄位不一致會記錄錯誤，不再靠猜欄位名稱。
+備援：
+- `OPENROUTER_API_KEY`
+- `OPENROUTER_MODEL=openrouter/free`
+- `GROQ_API_KEY`
+- `GROQ_MODEL`
 
-## Render 環境變數
-必要：`LINE_CHANNEL_SECRET`、`LINE_CHANNEL_ACCESS_TOKEN`、`GOOGLE_SHEET_ID`、`GOOGLE_SERVICE_ACCOUNT_JSON`、`GEMINI_API_KEY`（AI功能需要）。
-模型：`GEMINI_MODEL`（預設 `gemini-3.1-flash-lite`）。
-可保留舊的 `AI_DAILY_REQUEST_LIMIT`、`AI_TOTAL_DAILY_LIMIT` 等環境變數，但 **V1.9.1 的實際 AI 每日上限以 Google Sheet 設定／AI額度管理為準**。
+其他：
+- `AI_PROVIDER_ORDER=gemini,openrouter,groq`
+- `AI_PRIVATE_DATA_FALLBACK=false`
 
-## 部署
-Build：`npm install`
-Start：`node server.js`
-Health：`/health`
+## 額度
+`AI額度管理` 的既有邏輯保留：`剩餘次數 = 每日基本額度 + 額外次數 - 今日已用`。G 欄維持 Excel 公式，程式不覆蓋 G 欄公式。
 
-## AI 額度計數實作
-- 每次實際送出 Gemini generateContent 請求前預扣 1 次本地 AI 額度；這可避免 API 重試或並行請求繞過每日上限。
-- 使用者與全站額度都由「AI額度管理」F欄今日已用、D欄基本額度、E欄額外次數決定。
-- 課程查詢若需要 Gemini 文字整理，與一般 AI 客服共用同一套 AI 額度。
-- 未呼叫 Gemini 的情況（權限不足、查無課程、課表沒有該欄位、輸入超長、冷卻中、已達額度）不扣 AI 次數。
+## 商業／付費層
+本版本提供「服務額度」所需的單一請求扣額與多通道路由基礎，但**沒有假裝已完成金流**。若要收費，應另外把付款／方案資料與 AI 額度連結，避免把供應商 API 免費配額直接當作商品轉售。

@@ -1,7 +1,7 @@
 services:
   - type: web
-    name: line-frontend-customer-service
-    runtime: node
+    name: line-frontend-customer-service-v2
+    env: node
     buildCommand: npm install
     startCommand: node server.js
-    healthCheckPath: /health
+    autoDeploy: true
