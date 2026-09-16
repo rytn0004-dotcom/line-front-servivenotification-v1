@@ -1,0 +1,5 @@
+V1.7 deployment pairing:
+1) Use LINE_課程提醒_精簡正式版_V1.7.xlsx as the Google Sheets master layout.
+2) In Google Sheets, keep the exact sheet names/headers. The program validates them at startup.
+3) In 聯絡人, set 課表查詢權限=是 only after confirming a user/student binding.
+4) For rebind after the 3-minute grace period, review the 綁定審核 sheet and set 管理員結果=核准. The next user interaction applies it, then 課表查詢權限 returns to 否 until re-enabled.
