@@ -1,8 +1,9 @@
-V1.7 deployment pairing:
-1) Use LINE_課程提醒_精簡正式版_V1.7.xlsx as the Google Sheets master layout.
-2) In Google Sheets, keep the exact sheet names/headers. The program validates them at startup.
-3) In 聯絡人, set 課表查詢權限=是 only after confirming a user/student binding.
-4) For rebind after the 3-minute grace period, review the 綁定審核 sheet and set 管理員結果=核准. The next user interaction applies it, then 課表查詢權限 returns to 否 until re-enabled.
-
-
-V1.8.1 migration note: on startup, the server automatically adds the missing '課表查詢權限' column to the 聯絡人 sheet when the existing master sheet uses the older 9-column layout. Existing rows are initialized to '否'. The server also keeps the /health endpoint and logs startup preflight failures with stack traces.
+V1.9.2 修正重點
+- 「今天星期幾／今日日期／現在時間」由後端依 Asia/Taipei 直接回答，不交給 Gemini 猜。
+- AI客服模式遇到課程/上課/課表問題或單獨輸入人名時，不會自動查個人課表，改提示使用「② 課程查詢」。
+- 課程查詢每次都重新檢查 LINE User ID、綁定狀態與「課表查詢權限=是」；未授權不回傳任何學生課表資料。
+- 課表資料只來自「實際課程」；不提供的學習狀況、成績、測驗、進度、出勤等資料不會讓 AI 猜測。
+- 課程查不到時不呼叫 Gemini。
+- 一般 AI 可回答一般知識，風格改為專業、直接、避免制式寒暄與無關邀請。
+- AI 呼叫時會提供後端目前時間，並將姓名本身明確視為非授權憑證。
+- 選單延遲提示保留：主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。
