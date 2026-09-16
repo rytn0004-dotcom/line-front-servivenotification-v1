@@ -3,3 +3,6 @@ V1.7 deployment pairing:
 2) In Google Sheets, keep the exact sheet names/headers. The program validates them at startup.
 3) In 聯絡人, set 課表查詢權限=是 only after confirming a user/student binding.
 4) For rebind after the 3-minute grace period, review the 綁定審核 sheet and set 管理員結果=核准. The next user interaction applies it, then 課表查詢權限 returns to 否 until re-enabled.
+
+
+V1.8.1 migration note: on startup, the server automatically adds the missing '課表查詢權限' column to the 聯絡人 sheet when the existing master sheet uses the older 9-column layout. Existing rows are initialized to '否'. The server also keeps the /health endpoint and logs startup preflight failures with stack traces.

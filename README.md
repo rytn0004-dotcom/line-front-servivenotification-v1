@@ -1,73 +1,57 @@
-# LINE Frontend / Customer Service Web Service v1.5
+# LINE 客服系統 V1.9.1｜Gemini＋安全綁定＋AI額度管理
 
-這個版本在原本 LINE + Google Sheets 綁定流程上加入 Gemini AI 客服，採「主動進入 AI 客服才呼叫 AI」的節省額度設計。
+## 核心功能
+- LINE 選單：1 LINE綁定、2 課程查詢、3 繳費／收據、4 AI客服、5 人工客服。
+- 新好友與選單提示：
+  「主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入『選單』。」
+- 初次綁定：姓名確認後完成綁定；首次最多 3 次重新輸入機會；完成後 3 分鐘內可更正一次。超過反悔期的重新綁定需管理員審核。
+- 課表查詢：只有「聯絡人」中的「課表查詢權限=是」才可使用；後端先依 LINE User ID＋已綁定學生／老師篩選「實際課程」，再交 Gemini 整理。
+- AI客服：一般知識、科技、學習、生活等問題可正常回答；涉及補習班內部資料只能使用後端提供的正式資料。
+- 課表查詢不使用一般 AI 對話記憶；查無資料或資料欄位不存在時不讓 AI 自行猜測。
 
-## 功能
-- `選單` -> 1 LINE 綁定 / 2 課程查詢 / 3 繳費／收據（尚未串接） / 4 AI 客服 / 5 人工客服。
-- LINE 綁定改為「一次性綁定授權碼」模式；家長／老師不能靠輸入任意姓名來取得授權。
-- 課程查詢採「後端先授權、再查 Google Sheet、最後交 Gemini 整理」：AI 不直接讀取整份課表。
-- 家長只能查自己已綁定的學生；老師只能查自己已綁定姓名的課表。使用者不能靠輸入其他學生姓名取得未授權資料。
-- 預設課表工作表為「課表」；若不存在，啟動時會自動建立標題列，避免整個服務因分頁不存在而故障。
-- AI 客服使用 Google Gemini `gemini-2.5-flash-lite`，預設不會在一般訊息自動呼叫 AI。
-- 每位 LINE 使用者有獨立的短期對話記憶，只保留最近幾輪；部署重啟後記憶會清除。
-- 內建每日「單一使用者」與「全系統」AI 請求保護上限，避免測試程式失控大量消耗免費配額。
-- AI 只會取得目前 LINE 綁定的「身分」作為背景，不主動把學生姓名或教師姓名送給模型，也不會把整份 Google Sheet 丟給模型。
-- AI 不知道的課程、繳費、收據、教師安排與學生個資事項，提示詞要求它不要猜，應請人工客服確認。
-- `health` 會回報 Gemini 是否啟用、模型及本地保護上限。
+## AI額度管理（本版重點）
+- **不再以 Render 環境變數作為每日 AI 上限的權威來源。** 每日額度由 Google Sheet 的「系統設定」與「AI額度管理」共同控制。
+- 「系統設定」：
+  - AI 聊天功能：是／否
+  - 每人每日基本額度：新使用者／每日換日重置時採用
+  - 全站每日總額度：全站上限
+  - 單次輸入最大字數：超過即拒絕，不呼叫 Gemini
+  - AI 回覆最大 Tokens：直接控制 Gemini `maxOutputTokens`
+  - AI 呼叫冷卻秒數：不足冷卻時間不呼叫 Gemini
+  - AI 對話閒置分鐘數：AI 模式進入及每次成功請求後延長互動時間
+  - 人工客服時停用 AI：人工客服模式不進 AI 路徑
+- 「AI額度管理」：
+  - D 每日基本額度、E 額外次數、F 今日已用、G 剩餘次數=D+E-F、H 額度日期、I 額度操作、J 操作狀態、K 最後使用時間。
+  - D 每次 AI 使用前都同步「系統設定」的「每人每日基本額度」；E 則保留管理員額外加給，因此系統設定一改就立即影響上限。
+  - 每次實際發出 Gemini `generateContent` 請求前就先保留並扣 1 次，避免重試／並行請求繞過上限。
+  - 課程查詢若需要 Gemini 整理，同樣計入 AI 額度；若權限不足、查無課程、或問到課表沒有的欄位，不呼叫 Gemini、不扣 AI 次數。
+  - I 欄可輸入：`+5`、`+10`、`+20`、`+50`、`清除額外次數`、`重置今日用量`；下一次該使用者呼叫 AI 時自動套用。
+  - 全站使用 `LINE User ID = __GLOBAL__` 的一列統計。
 
-## 綁定授權碼（重要）
+## 安全原則
+- LINE webhook 驗證 `X-Line-Signature`。
+- 課表查詢權限由後台「聯絡人」控制，不由使用者輸入名稱自行授權。
+- Gemini 永遠只收到後端已授權的必要資料，不會直接讀整份 Google Sheet。
+- 課表查詢不讀一般 AI 聊天歷史，避免把過去的錯誤答案當成新資料。
 
-為避免「輸入別人的名字再重新綁定」或大量窮舉造成資料外洩，系統不再接受使用者自行指定可查的學生／老師。請管理員在 Google Sheet 建立 `綁定授權碼` 工作表並填入一組一次性、不可預測的授權碼。
-
-欄位：`授權碼`、`身分`、`可綁定學生`、`可綁定老師`、`狀態`、`綁定LINE User ID`、`使用時間`。
-
-家長範例：`A8KQ7M2ZP4TX` / `家長` / `蔡時明、蔡小華` / 空白 / `可用`。
-老師範例：`R5NW9X3BC7LD` / `老師` / 空白 / `王小明` / `可用`。
-
-授權碼確認後會標記為 `已使用` 並綁定 LINE User ID。使用者每個時間窗最多嘗試 `BIND_CODE_MAX_ATTEMPTS` 次；預設 5 次 / 10 分鐘。建議授權碼至少 12 碼，使用系統附帶的 `generate-bind-code.js` 產生隨機碼。**不要使用學生姓名、生日、電話末碼等可猜測字串當授權碼。**
-
-管理員可在本機執行：`node generate-bind-code.js`，每次取得一組新的隨機授權碼。
+## 標準 Excel 工作表與詞彙
+- 聯絡人：`姓名`、`身分`、`學生姓名/關聯（可多位）`、`LINE User ID`、`綁定狀態`、`最後綁定時間`、`通知啟用`、`備註`、`測試對象`、`課表查詢權限`。
+- 實際課程：`Course ID`、`課程日期`、`星期`、`上課時間`、`學生`、`課程`、`老師`、`校區`、`來源`、`固定課表ID`、`調課ID`、`調課結果`、`備註`。
+- AI額度管理：`LINE User ID`、`LINE 顯示名稱／姓名`、`身分`、`每日基本額度`、`額外次數`、`今日已用`、`剩餘次數`、`額度日期`、`額度操作`、`操作狀態`、`最後使用時間`、`備註`。
+- 程式啟動會檢查上述標準欄位；欄位不一致會記錄錯誤，不再靠猜欄位名稱。
 
 ## Render 環境變數
-必要：
-- `LINE_CHANNEL_SECRET`
-- `LINE_CHANNEL_ACCESS_TOKEN`
-- `GOOGLE_SHEET_ID`
-- `GOOGLE_SERVICE_ACCOUNT_JSON`
-
-AI：
-- `GEMINI_API_KEY`
-- `GEMINI_MODEL`（預設 `gemini-2.5-flash-lite`）
-- `AI_MAX_OUTPUT_TOKENS`（預設 500）
-- `AI_MAX_HISTORY_TURNS`（預設 6）
-- `AI_DAILY_REQUEST_LIMIT`（預設每位 LINE 使用者每日 30 次）
-- `AI_TOTAL_DAILY_LIMIT`（預設全系統每日 300 次）
-- `COURSE_SHEET_NAME`（預設 `課表`）
-- `COURSE_QUERY_MAX_ROWS`（預設 20，單次最多提供給 AI 的已授權課程筆數）
-- `BIND_AUTH_SHEET_NAME`（預設 `綁定授權碼`）
-- `BIND_CODE_MAX_ATTEMPTS`（預設 5）
-- `BIND_CODE_WINDOW_MS`（預設 600000，10 分鐘）
-- `AI_SYSTEM_PROMPT`（可選，用來自訂客服人格與規則）
-
-未設定 `GEMINI_API_KEY` 時，主程式仍可正常運作，但選單的 AI 客服會提示尚未設定。
+必要：`LINE_CHANNEL_SECRET`、`LINE_CHANNEL_ACCESS_TOKEN`、`GOOGLE_SHEET_ID`、`GOOGLE_SERVICE_ACCOUNT_JSON`、`GEMINI_API_KEY`（AI功能需要）。
+模型：`GEMINI_MODEL`（預設 `gemini-3.1-flash-lite`）。
+可保留舊的 `AI_DAILY_REQUEST_LIMIT`、`AI_TOTAL_DAILY_LIMIT` 等環境變數，但 **V1.9.1 的實際 AI 每日上限以 Google Sheet 設定／AI額度管理為準**。
 
 ## 部署
-Render Build：`npm install`
-Render Start：`node server.js`
+Build：`npm install`
+Start：`node server.js`
 Health：`/health`
 
-## Gemini 免費方案注意事項
-Google AI Studio / Gemini API 的免費方案與配額會依模型及政策調整。此版本因此另外加入本地使用量上限，避免超額請求；實際可用量仍以 Google 官方帳戶當下配額為準。
-
-## 課表欄位
-預設會自動建立：`學生姓名`、`日期`、`星期`、`上課時段`、`班別負責老師`、`備註與課務說明`。程式會自動尋找包含 `學生姓名` 與 `上課時段` 的標題列；日期、星期、老師、備註欄位可依上述名稱使用。
-
-## 安全設計
-- LINE webhook 驗證 `X-Line-Signature`。
-- 第一次綁定與重新綁定都需要管理員一次性授權碼；**不再接受使用者自行輸入學生姓名／老師姓名來建立授權**。
-- 授權碼決定可綁定的學生／老師，確認後即失效並記錄 LINE User ID。
-- 綁定碼有嘗試次數限制，降低窮舉風險；錯誤回覆不揭露「名稱是否存在」等可用於枚舉的資訊。
-- 查課前以 LINE User ID 對應綁定資料。
-- 家長只以 `綁定暫存` 裡的 `studentNames` 作為可查範圍；老師只以已綁定的 `teacherName` 作為可查範圍。
-- Gemini 永遠拿不到整份 Google Sheet；它收到的是後端已完成授權的課程結果。
-- API 金鑰只使用 Render Environment Variables，不放在前端。
+## AI 額度計數實作
+- 每次實際送出 Gemini generateContent 請求前預扣 1 次本地 AI 額度；這可避免 API 重試或並行請求繞過每日上限。
+- 使用者與全站額度都由「AI額度管理」F欄今日已用、D欄基本額度、E欄額外次數決定。
+- 課程查詢若需要 Gemini 文字整理，與一般 AI 客服共用同一套 AI 額度。
+- 未呼叫 Gemini 的情況（權限不足、查無課程、課表沒有該欄位、輸入超長、冷卻中、已達額度）不扣 AI 次數。
