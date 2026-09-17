@@ -1,1 +1,6 @@
-V2.0 多通道：一次請求只扣 1 次額度；主通道失敗改走備援不重複扣額。課程／學生私有資料預設不送備援通道。
+V2.1 建議部署：
+1. 上傳 server.js / package.json / README.md / .env.example / render.yaml。
+2. Render 保留原有必要環境變數。
+3. 若要使用多通道文字 AI，再設定 OPENROUTER_API_KEY / GROQ_API_KEY。
+4. 媒體資源上限可直接用 Render Environment Variables 控制；若 Google Sheet 系統設定已存在，Google Sheet 數值優先。
+5. 首次啟動會自動建立媒體相關系統設定與 AI額度管理 O/P 欄位。

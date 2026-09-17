@@ -19,6 +19,17 @@ const GROQ_MODEL=process.env.GROQ_MODEL||'';
 const GROQ_BASE_URL=process.env.GROQ_BASE_URL||'https://api.groq.com/openai/v1/chat/completions';
 const AI_PROVIDER_ORDER=(process.env.AI_PROVIDER_ORDER||'gemini,openrouter,groq').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
 const ALLOW_PRIVATE_AI_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.AI_PRIVATE_DATA_FALLBACK||'false'));
+const DEFAULT_IMAGE_COST=2;
+const DEFAULT_DOCUMENT_COST=3;
+const DEFAULT_MAX_IMAGE_MB=8;
+const DEFAULT_MAX_DOCUMENT_MB=10;
+const DEFAULT_MAX_USER_MEDIA_MB=30;
+const DEFAULT_MAX_GLOBAL_MEDIA_MB=300;
+const DEFAULT_MEDIA_CONCURRENCY=1;
+const MEDIA_TYPES=new Set(['image/jpeg','image/png','image/webp','image/heic','image/heif']);
+const DOCUMENT_TYPES=new Set(['application/pdf']);
+const MEDIA_RESOURCE_SHEET_COLUMNS={bytes:14,date:15}; // O/P; keep G/H formulas untouched.
+const MEDIA_UPLOAD_TEMP_DIR=process.env.MEDIA_UPLOAD_TEMP_DIR||'/tmp/line-customer-media';
 const AI_MAX_HISTORY_TURNS=Math.max(1,Number(process.env.AI_MAX_HISTORY_TURNS||6));
 const DEFAULT_AI_OUTPUT_TOKENS=500;
 const INITIAL_REBIND_MAX=Math.max(1,Number(process.env.INITIAL_REBIND_MAX||3));
@@ -42,8 +53,9 @@ app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
 const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
 const logBuffer=[];let logTimer=null;
-const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map()};
+const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
+const mediaSemaphore={active:0,queue:[]};
 async function withAIQuotaLock(fn){const prev=aiQuotaLock.tail;let release;aiQuotaLock.tail=new Promise(r=>release=r);await prev;try{return await fn();}finally{release();}}
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -65,7 +77,7 @@ async function readSnapshot(force=false){
   if(!force&&cache.snapshot&&cache.expiresAt>Date.now())return cache.snapshot;
   if(cache.inFlight)return cache.inFlight;
   cache.inFlight=retry('snapshot',async()=>{
-    const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:N`];
+    const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:P`];
     const r=await sheets.spreadsheets.values.batchGet({spreadsheetId:SHEET_ID,ranges,majorDimension:'ROWS'});
     const contacts=r.data.valueRanges?.[0]?.values||[],courses=r.data.valueRanges?.[4]?.values||[],reviews=r.data.valueRanges?.[5]?.values||[],aiQuotas=r.data.valueRanges?.[6]?.values||[];
     return {contacts,contactsHeaderRow:headerRow(contacts,['姓名','身分','學生姓名/關聯（可多位）','LINE User ID','課表查詢權限']),bindings:r.data.valueRanges?.[1]?.values||[],interactions:r.data.valueRanges?.[2]?.values||[],settings:r.data.valueRanges?.[3]?.values||[],settingsHeaderRow:headerRow(r.data.valueRanges?.[3]?.values||[],['設定項目','目前值']),courses,coursesHeaderRow:headerRow(courses,['Course ID','學生','上課時間']),reviews,reviewsHeaderRow:headerRow(reviews,['申請時間','LINE User ID','申請狀態']),aiQuotas,aiQuotasHeaderRow:headerRow(aiQuotas,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期'])};
@@ -95,6 +107,42 @@ async function ensureAIQuotaSheet(){
   ]]);
   console.log(`Created ${AI_QUOTA_SHEET} sheet.`);
   return true;
+}
+
+
+async function ensureMediaSettings(){
+  const r=await retry('media settings read',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(SETTINGS_SHEET)}!A:D`,majorDimension:'ROWS'}));
+  const rows=r.data.values||[];
+  const h=headerRow(rows,['設定項目','目前值']);
+  if(h<0)throw new Error('系統設定找不到標準標題列：設定項目、目前值。');
+  const existing=new Set(rows.slice(h+1).map(x=>String(x?.[0]||'').trim()).filter(Boolean));
+  const add=[
+    ['AI 圖片額度',String(DEFAULT_IMAGE_COST)],
+    ['AI 文件額度',String(DEFAULT_DOCUMENT_COST)],
+    ['AI 圖片最大 MB',String(DEFAULT_MAX_IMAGE_MB)],
+    ['AI 文件最大 MB',String(DEFAULT_MAX_DOCUMENT_MB)],
+    ['AI 每人每日媒體 MB',String(DEFAULT_MAX_USER_MEDIA_MB)],
+    ['AI 全站每日媒體 MB',String(DEFAULT_MAX_GLOBAL_MEDIA_MB)],
+    ['AI 媒體同時處理數',String(DEFAULT_MEDIA_CONCURRENCY)]
+  ].filter(r=>!existing.has(r[0]));
+  if(add.length)await append(SETTINGS_SHEET,add);
+  return add.length;
+}
+async function ensureAIQuotaMediaColumns(){
+  const r=await retry('AI quota media schema',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(AI_QUOTA_SHEET)}!A:P`,majorDimension:'ROWS'}));
+  const rows=r.data.values||[];
+  const h=headerRow(rows,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期']);
+  if(h<0)throw new Error('AI額度管理找不到標準標題列。');
+  const header=rows[h]||[];
+  const updates=[];
+  if(String(header[14]||'').trim()!=='今日媒體 MB')updates.push({range:`O${h+1}`,values:[['今日媒體 MB']]});
+  if(String(header[15]||'').trim()!=='媒體額度日期')updates.push({range:`P${h+1}`,values:[['媒體額度日期']]});
+  for(const u of updates)await update(AI_QUOTA_SHEET,u.range,u.values);
+  if(rows.length>h+1){
+    const data=rows.slice(h+1).map(r=>[String(r?.[14]||'').trim(),String(r?.[15]||'').trim()]);
+    const normalized=data.map((r)=>[r[0]||'0',r[1]||dayKey()]);
+    await update(AI_QUOTA_SHEET,`O${h+2}:P${rows.length}`,normalized);
+  }
 }
 
 async function ensureContactPermissionColumn(){
@@ -185,7 +233,26 @@ function authorizedCourses(s,uid,text){const c=contactByUid(s,uid);if(!c||c.stat
 
 function formatCourseRows(rows){return rows.map((x,i)=>{const head=rows.length>1?`課程 ${i+1}`:'課程';return `${head}：\n日期：${x.date||'未提供'}\n星期：${x.weekday||'未提供'}\n時間：${x.time||'未提供'}\n學生：${x.student||'未提供'}\n課程：${x.course||'未提供'}\n老師：${x.teacher||'未提供'}\n校區：${x.campus||'未提供'}\n備註：${x.note||'無'}`;}).join('\n\n');}
 function courseQueryAsksUnsupportedInfo(text){return /(學習狀況|學習情況|成績|測驗|考試結果|表現|進度|出勤|缺課|評語|能力|排名)/.test(String(text||''));}
-function resetInMemoryQuota(q){const d=dayKey();if(q.day!==d){q.day=d;q.total=0;q.users.clear();q.lastUse.clear();}}
+function resetInMemoryQuota(q){
+  const d=dayKey();
+  if(q.day!==d){q.day=d;q.total=0;q.users.clear();q.lastUse.clear();q.mediaBytesGlobal=0;q.mediaBytesUsers.clear();}
+}
+async function withMediaSlot(fn){
+  const limit=Math.max(1,Number(process.env.MEDIA_CONCURRENCY||DEFAULT_MEDIA_CONCURRENCY));
+  if(mediaSemaphore.active>=limit)await new Promise(resolve=>mediaSemaphore.queue.push(resolve));
+  mediaSemaphore.active++;
+  try{return await fn();}finally{
+    mediaSemaphore.active--;
+    const next=mediaSemaphore.queue.shift();
+    if(next)next();
+  }
+}
+function settingsNumber(settings,key,envKey,fallback){
+  const sheet=Number(String(settings?.[key]??'').trim());
+  if(Number.isFinite(sheet)&&sheet>0)return sheet;
+  const env=Number(String(process.env[envKey]??'').trim());
+  return Number.isFinite(env)&&env>0?env:fallback;
+}
 function aiHistory(uid){return ai.history.get(uid)||[];}
 function clearHistory(uid){ai.history.delete(uid);}
 function parseTaipeiValue(v){
@@ -200,7 +267,7 @@ function quotaMeta(s){
   const rows=s.aiQuotas||[],h=s.aiQuotasHeaderRow;
   if(h<0)return null;
   const header=(rows[h]||[]).map(x=>String(x).trim()),idx=n=>header.indexOf(n);
-  return {row:h,uid:idx('LINE User ID'),name:idx('LINE 顯示名稱／姓名'),role:idx('身分'),base:idx('每日基本額度'),extra:idx('額外次數'),used:idx('今日已用'),remain:idx('剩餘次數'),date:idx('額度日期'),op:idx('額度操作'),opStatus:idx('操作狀態'),last:idx('最後使用時間'),note:idx('備註')};
+  return {row:h,uid:idx('LINE User ID'),name:idx('LINE 顯示名稱／姓名'),role:idx('身分'),base:idx('每日基本額度'),extra:idx('額外次數'),used:idx('今日已用'),remain:idx('剩餘次數'),date:idx('額度日期'),op:idx('額度操作'),opStatus:idx('操作狀態'),last:idx('最後使用時間'),note:idx('備註'),mediaBytes:MEDIA_RESOURCE_SHEET_COLUMNS.bytes,mediaDate:MEDIA_RESOURCE_SHEET_COLUMNS.date};
 }
 function findAIQuota(s,uid){const m=quotaMeta(s);if(!m)return null;for(let i=m.row+1;i<(s.aiQuotas||[]).length;i++){const r=s.aiQuotas[i]||[];if(norm(r[m.uid])===norm(uid))return {row:i+1,r,meta:m};}return null;}
 function quotaNumber(v,def=0){const n=Number(String(v??'').trim());return Number.isFinite(n)?n:def;}
@@ -215,12 +282,14 @@ async function applyQuotaOperation(s,entry,baseDefault,totalDefault){
   }else if(op==='清除額外次數'){
     row[m.extra]='0';row[m.op]='無';row[m.opStatus]='已套用';changed=true;
   }else if(op==='重置今日用量'){
-    row[m.used]='0';row[m.date]=dayKey();row[m.last]='';row[m.op]='無';row[m.opStatus]='已套用';changed=true;
+    row[m.used]='0';row[m.date]=dayKey();row[m.last]='';row[m.op]='無';row[m.opStatus]='已套用';
+    row[m.mediaBytes]='0';row[m.mediaDate]=dayKey();changed=true;
   }
   if(changed){
     // G=剩餘次數與 H=額度日期由試算表公式維護；更新時絕對不要覆蓋公式。
     await update(AI_QUOTA_SHEET,`A${entry.row}:F${entry.row}`,[row.slice(0,6)]);
     await update(AI_QUOTA_SHEET,`H${entry.row}:N${entry.row}`,[row.slice(7,14)]);
+    await update(AI_QUOTA_SHEET,`O${entry.row}:P${entry.row}`,[row.slice(14,16)]);
     s.aiQuotas[entry.row-1]=row;entry.r=row;
     await ensureQuotaFormulas(entry.row);
   }
@@ -237,7 +306,7 @@ async function ensureAIQuotaRow(s,uid,lineName,role,settings){
   const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
   if(!entry){
     const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,14)).fill('');
-    row[m.uid]=uid;row[m.name]=lineName||'';row[m.role]=role||'';row[m.base]=String(baseDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='待處理';row[m.last]='';row[m.note]='由系統依「系統設定」建立';
+    row[m.uid]=uid;row[m.name]=lineName||'';row[m.role]=role||'';row[m.base]=String(baseDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='待處理';row[m.last]='';row[m.note]='由系統依「系統設定」建立';row[m.mediaBytes]='0';row[m.mediaDate]=dayKey();
     await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};
     await ensureQuotaFormulas(entry.row);
   }
@@ -250,67 +319,108 @@ async function ensureGlobalAIQuota(s,settings){
   const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
   if(!entry){
     const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,14)).fill('');
-    row[m.uid]='__GLOBAL__';row[m.name]='全站';row[m.role]='全站';row[m.base]=String(totalDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='系統管理';row[m.last]='';row[m.note]='全站上限由「系統設定」控制';
+    row[m.uid]='__GLOBAL__';row[m.name]='全站';row[m.role]='全站';row[m.base]=String(totalDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='系統管理';row[m.last]='';row[m.note]='全站上限由「系統設定」控制';row[m.mediaBytes]='0';row[m.mediaDate]=dayKey();
     await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};
     await ensureQuotaFormulas(entry.row);
   }
   entry=await applyQuotaOperation(s,entry,aiSettingNum(settings,'每人每日基本額度',2),totalDefault);
   return entry;
 }
-async function reserveAIQuota(s,uid,lineName,role,settings,inputText=''){
+
+async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}){
   return withAIQuotaLock(async()=>{
-  resetInMemoryQuota(ai);
-  const enabled=!/^否|false|0$/i.test(String(settings['AI 聊天功能']??'是').trim());
-  if(!enabled)throw new Error('AI_DISABLED');
-  const maxChars=aiSettingNum(settings,'單次輸入最大字數',300);
-  if(String(uid||'').length<1)throw new Error('AI_UID');
-  const textLen=String(inputText||'').length;
-  if(textLen>maxChars)throw new Error('AI_INPUT_LIMIT');
-  const baseDefault=aiSettingNum(settings,'每人每日基本額度',2);
-  const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
-  const user=await ensureAIQuotaRow(s,uid,lineName,role,settings);
-  const global=await ensureGlobalAIQuota(s,settings);
-  const today=dayKey();
-  const um=user.r,gm=global.r,uq=user.meta,gq=global.meta;
-  // Base quota always follows the current System Settings immediately; extra quota is preserved.
-  let userChanged=false,globalChanged=false;
-  if(String(um[uq.base]||'')!==String(baseDefault)){um[uq.base]=String(baseDefault);userChanged=true;}
-  if(String(gm[gq.base]||'')!==String(totalDefault)){gm[gq.base]=String(totalDefault);globalChanged=true;}
-  if(String(um[uq.date]||'')!==today){um[uq.used]='0';um[uq.date]=today;um[uq.last]='';userChanged=true;}
-  if(String(gm[gq.date]||'')!==today){gm[gq.used]='0';gm[gq.date]=today;gm[gq.last]='';globalChanged=true;}
-  if(userChanged){
-    await update(AI_QUOTA_SHEET,`A${user.row}:F${user.row}`,[um.slice(0,6)]);
-    await update(AI_QUOTA_SHEET,`H${user.row}:N${user.row}`,[um.slice(7,14)]);
-    s.aiQuotas[user.row-1]=um;
+    resetInMemoryQuota(ai);
+    const enabled=!/^否|false|0$/i.test(String(settings['AI 聊天功能']??'是').trim());
+    if(!enabled)throw new Error('AI_DISABLED');
+    const maxChars=aiSettingNum(settings,'單次輸入最大字數',300);
+    if(String(uid||'').length<1)throw new Error('AI_UID');
+    const textLen=String(inputText||'').length;
+    if(textLen>maxChars)throw new Error('AI_INPUT_LIMIT');
+
+    const cost=Math.max(1,Number(usage.cost||1));
+    const mediaBytes=Math.max(0,Number(usage.mediaBytes||0));
+    const mediaKind=String(usage.mediaKind||'').trim();
+    const baseDefault=aiSettingNum(settings,'每人每日基本額度',2);
+    const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
+    const user=await ensureAIQuotaRow(s,uid,lineName,role,settings);
+    const global=await ensureGlobalAIQuota(s,settings);
+    await ensureAIQuotaMediaColumns();
+
+    const today=dayKey();
+    const um=user.r,gm=global.r,uq=user.meta,gq=global.meta;
+    let userChanged=false,globalChanged=false;
+    if(String(um[uq.base]||'')!==String(baseDefault)){um[uq.base]=String(baseDefault);userChanged=true;}
+    if(String(gm[gq.base]||'')!==String(totalDefault)){gm[gq.base]=String(totalDefault);globalChanged=true;}
+
+    if(String(um[uq.date]||'')!==today){um[uq.used]='0';um[uq.date]=today;um[uq.last]='';userChanged=true;}
+    if(String(gm[gq.date]||'')!==today){gm[gq.used]='0';gm[gq.date]=today;gm[gq.last]='';globalChanged=true;}
+    if(String(um[uq.mediaDate]||'')!==today){um[uq.mediaBytes]='0';um[uq.mediaDate]=today;userChanged=true;}
+    if(String(gm[gq.mediaDate]||'')!==today){gm[gq.mediaBytes]='0';gm[gq.mediaDate]=today;globalChanged=true;}
+
+    if(userChanged){
+      await update(AI_QUOTA_SHEET,`A${user.row}:F${user.row}`,[um.slice(0,6)]);
+      await update(AI_QUOTA_SHEET,`H${user.row}:N${user.row}`,[um.slice(7,14)]);
+      await update(AI_QUOTA_SHEET,`O${user.row}:P${user.row}`,[um.slice(14,16)]);
+      s.aiQuotas[user.row-1]=um;
+      await ensureQuotaFormulas(user.row);
+    }
+    if(globalChanged){
+      await update(AI_QUOTA_SHEET,`A${global.row}:F${global.row}`,[gm.slice(0,6)]);
+      await update(AI_QUOTA_SHEET,`H${global.row}:N${global.row}`,[gm.slice(7,14)]);
+      await update(AI_QUOTA_SHEET,`O${global.row}:P${global.row}`,[gm.slice(14,16)]);
+      s.aiQuotas[global.row-1]=gm;
+      await ensureQuotaFormulas(global.row);
+    }
+
+    const userLimit=quotaNumber(um[uq.base],baseDefault)+quotaNumber(um[uq.extra],0);
+    const userUsed=quotaNumber(um[uq.used],0);
+    const globalLimit=quotaNumber(gm[gq.base],totalDefault)+quotaNumber(gm[gq.extra],0);
+    const globalUsed=quotaNumber(gm[gq.used],0);
+    if(userUsed+cost>userLimit||globalUsed+cost>globalLimit)throw new Error('AI_LIMIT');
+
+    if(mediaBytes>0){
+      const maxUserMediaMB=settingsNumber(settings,'AI 每人每日媒體 MB','AI_MAX_USER_MEDIA_MB',DEFAULT_MAX_USER_MEDIA_MB);
+      const maxGlobalMediaMB=settingsNumber(settings,'AI 全站每日媒體 MB','AI_MAX_GLOBAL_MEDIA_MB',DEFAULT_MAX_GLOBAL_MEDIA_MB);
+      const maxUserBytes=maxUserMediaMB*1024*1024,maxGlobalBytes=maxGlobalMediaMB*1024*1024;
+      const userMedia=quotaNumber(um[uq.mediaBytes],0)*1024*1024;
+      const globalMedia=quotaNumber(gm[gq.mediaBytes],0)*1024*1024;
+      if(mediaBytes>maxUserBytes-userMedia||mediaBytes>maxGlobalBytes-globalMedia){
+        const err=new Error('AI_MEDIA_LIMIT');err.mediaKind=mediaKind;err.maxUserMediaMB=maxUserMediaMB;err.maxGlobalMediaMB=maxGlobalMediaMB;throw err;
+      }
+    }
+
+    const cooldown=aiSettingNum(settings,'AI 呼叫冷卻秒數',2);
+    const lastSheet=parseTaipeiValue(um[uq.last]),lastMemory=ai.lastUse.get(uid)||0,last=Math.max(Number.isFinite(lastSheet)?lastSheet:0,lastMemory);
+    if(last>0){const left=cooldown*1000-(Date.now()-last);if(left>0){const err=new Error('AI_COOLDOWN');err.remainingMs=left;throw err;}}
+
+    um[uq.used]=String(userUsed+cost);um[uq.last]=nowTaipei();
+    gm[gq.used]=String(globalUsed+cost);gm[gq.last]=nowTaipei();
+    if(mediaBytes>0){
+      const umMB=quotaNumber(um[uq.mediaBytes],0)+mediaBytes/1024/1024;
+      const gmMB=quotaNumber(gm[gq.mediaBytes],0)+mediaBytes/1024/1024;
+      um[uq.mediaBytes]=umMB.toFixed(3);
+      gm[gq.mediaBytes]=gmMB.toFixed(3);
+      um[uq.mediaDate]=today;gm[gq.mediaDate]=today;
+    }
+
+    await update(AI_QUOTA_SHEET,`F${user.row}` ,[[um[uq.used]]]);
+    await update(AI_QUOTA_SHEET,`H${user.row}:K${user.row}`,[um.slice(7,11)]);
+    await update(AI_QUOTA_SHEET,`O${user.row}:P${user.row}`,[um.slice(14,16)]);
+    await update(AI_QUOTA_SHEET,`F${global.row}` ,[[gm[gq.used]]]);
+    await update(AI_QUOTA_SHEET,`H${global.row}:K${global.row}`,[gm.slice(7,11)]);
+    await update(AI_QUOTA_SHEET,`O${global.row}:P${global.row}`,[gm.slice(14,16)]);
     await ensureQuotaFormulas(user.row);
-  }
-  if(globalChanged){
-    await update(AI_QUOTA_SHEET,`A${global.row}:F${global.row}`,[gm.slice(0,6)]);
-    await update(AI_QUOTA_SHEET,`H${global.row}:N${global.row}`,[gm.slice(7,14)]);
-    s.aiQuotas[global.row-1]=gm;
     await ensureQuotaFormulas(global.row);
-  }
-  const userLimit=quotaNumber(um[uq.base],baseDefault)+quotaNumber(um[uq.extra],0);
-  const userUsed=quotaNumber(um[uq.used],0);
-  const globalLimit=quotaNumber(gm[gq.base],totalDefault)+quotaNumber(gm[gq.extra],0);
-  const globalUsed=quotaNumber(gm[gq.used],0);
-  if(userUsed>=userLimit||globalUsed>=globalLimit)throw new Error('AI_LIMIT');
-  const cooldown=aiSettingNum(settings,'AI 呼叫冷卻秒數',2);
-  const lastSheet=parseTaipeiValue(um[uq.last]),lastMemory=ai.lastUse.get(uid)||0,last=Math.max(Number.isFinite(lastSheet)?lastSheet:0,lastMemory);
-  if(last>0){const left=cooldown*1000-(Date.now()-last);if(left>0){const err=new Error('AI_COOLDOWN');err.remainingMs=left;throw err;}}
-  // Reserve before network call so retries / parallel users cannot bypass the local daily allowance.
-  um[uq.used]=String(userUsed+1);um[uq.last]=nowTaipei();gm[gq.used]=String(globalUsed+1);gm[gq.last]=nowTaipei();
-  // 只更新 F 與 H:K，避免覆蓋 G=剩餘次數 的公式。
-  await update(AI_QUOTA_SHEET,`F${user.row}` ,[[um[uq.used]]]);
-  await update(AI_QUOTA_SHEET,`H${user.row}:K${user.row}`,[um.slice(7,11)]);
-  await update(AI_QUOTA_SHEET,`F${global.row}` ,[[gm[gq.used]]]);
-  await update(AI_QUOTA_SHEET,`H${global.row}:K${global.row}`,[gm.slice(7,11)]);
-  await ensureQuotaFormulas(user.row);
-  await ensureQuotaFormulas(global.row);
-  s.aiQuotas[user.row-1]=um;s.aiQuotas[global.row-1]=gm;ai.users.set(uid,userUsed+1);ai.total=globalUsed+1;ai.lastUse.set(uid,Date.now());
-  return {maxChars,maxOutputTokens:aiSettingNum(settings,'AI 回覆最大 Tokens',DEFAULT_AI_OUTPUT_TOKENS),idleMinutes:aiSettingNum(settings,'AI 對話閒置分鐘數',25)};
+
+    s.aiQuotas[user.row-1]=um;s.aiQuotas[global.row-1]=gm;
+    ai.users.set(uid,userUsed+cost);ai.total=globalUsed+cost;ai.lastUse.set(uid,Date.now());
+    ai.mediaBytesUsers.set(uid,quotaNumber(um[uq.mediaBytes],0)*1024*1024);
+    ai.mediaBytesGlobal=quotaNumber(gm[gq.mediaBytes],0)*1024*1024;
+
+    return {cost,mediaBytes,maxChars,maxOutputTokens:aiSettingNum(settings,'AI 回覆最大 Tokens',DEFAULT_AI_OUTPUT_TOKENS),idleMinutes:aiSettingNum(settings,'AI 對話閒置分鐘數',25)};
   });
 }
+
 function providerReady(name){
   if(name==='gemini')return !!GEMINI_API_KEY;
   if(name==='openrouter')return !!OPENROUTER_API_KEY;
@@ -347,36 +457,53 @@ async function callGemini(systemText,contents,maxOutputTokens,temperature){
   const answer=String(data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();if(!answer)throw new Error('Gemini empty');return answer;
 }
 function shouldUseProviderFallback(err){return /\b(?:401|402|403|404|408|409|429|500|502|503|504)\b/.test(String(err?.message||''));}
+
 function buildAIRequest(text,context,opts){
   const settings=opts.settings||{};const c=contactByUid(opts.snapshot||{},opts.uid||'')||null;const role=c?.role||opts.role||'未完成綁定';
   const systemContext=`目前系統時間（${TZ}）：${nowTaipei()}\n使用者身分：${role}${context?`\n\n後端背景：${context}`:''}`;
   const systemText=AI_PROMPT+'\n\n'+systemContext;
-  const geminiContents=opts.useHistory!==false?[...aiHistory(opts.uid||''),{role:'user',parts:[{text}]}]:[{role:'user',parts:[{text}]}];
+  const userParts=[{text}];
+  if(opts.mediaPart)userParts.push({inlineData:{mimeType:opts.mediaPart.mimeType,data:opts.mediaPart.dataBase64}});
+  const geminiContents=opts.useHistory!==false?[...aiHistory(opts.uid||''),{role:'user',parts:userParts}]:[{role:'user',parts:userParts}];
   const messages=[...(opts.useHistory!==false?historyToMessages(opts.uid||''):[]),{role:'user',content:text}];
   return {settings,systemText,geminiContents,messages};
 }
-async function releaseAIQuota(s,uid){
+
+async function releaseAIQuota(s,uid,usage={}){
   return withAIQuotaLock(async()=>{
     const fresh=await readSnapshot(true);const user=findAIQuota(fresh,uid),global=findAIQuota(fresh,'__GLOBAL__');
     if(!user||!global)return;
+    const cost=Math.max(1,Number(usage.cost||1));
+    const mediaBytes=Math.max(0,Number(usage.mediaBytes||0));
     const um=user.r,gm=global.r,uq=user.meta,gq=global.meta;
-    um[uq.used]=String(Math.max(0,quotaNumber(um[uq.used],0)-1));
-    gm[gq.used]=String(Math.max(0,quotaNumber(gm[gq.used],0)-1));
+    um[uq.used]=String(Math.max(0,quotaNumber(um[uq.used],0)-cost));
+    gm[gq.used]=String(Math.max(0,quotaNumber(gm[gq.used],0)-cost));
+    if(mediaBytes>0){
+      um[uq.mediaBytes]=String(Math.max(0,quotaNumber(um[uq.mediaBytes],0)-mediaBytes/1024/1024));
+      gm[gq.mediaBytes]=String(Math.max(0,quotaNumber(gm[gq.mediaBytes],0)-mediaBytes/1024/1024));
+    }
     await update(AI_QUOTA_SHEET,`F${user.row}` ,[[um[uq.used]]]);
     await update(AI_QUOTA_SHEET,`F${global.row}` ,[[gm[gq.used]]]);
+    await update(AI_QUOTA_SHEET,`O${user.row}:P${user.row}`,[um.slice(14,16)]);
+    await update(AI_QUOTA_SHEET,`O${global.row}:P${global.row}`,[gm.slice(14,16)]);
     await ensureQuotaFormulas(user.row);await ensureQuotaFormulas(global.row);
     fresh.aiQuotas[user.row-1]=um;fresh.aiQuotas[global.row-1]=gm;cache.snapshot=fresh;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
-    const memUsed=Math.max(0,(ai.users.get(uid)||1)-1);ai.users.set(uid,memUsed);ai.total=Math.max(0,(ai.total||1)-1);
+    const memUsed=Math.max(0,(ai.users.get(uid)||cost)-cost);ai.users.set(uid,memUsed);ai.total=Math.max(0,(ai.total||cost)-cost);
+    ai.mediaBytesUsers.set(uid,quotaNumber(um[uq.mediaBytes],0)*1024*1024);
+    ai.mediaBytesGlobal=quotaNumber(gm[gq.mediaBytes],0)*1024*1024;
   });
 }
+
+
 async function aiGenerate(uid,text,context,opts={}){
   const settings=opts.settings||{};const c=contactByUid(opts.snapshot||{},uid)||null;const role=c?.role||opts.role||'未完成綁定';
-  const q=await reserveAIQuota(opts.snapshot||{},uid,opts.lineName||'',role,settings,text);
+  const q=await reserveAIQuota(opts.snapshot||{},uid,opts.lineName||'',role,settings,text,{cost:opts.cost||1,mediaBytes:opts.mediaBytes||0,mediaKind:opts.mediaKind||''});
   const {systemText,geminiContents,messages}=buildAIRequest(text,context,{...opts,uid});
   const privateContext=!!opts.privateData;
-  const providers=privateContext&&!ALLOW_PRIVATE_AI_FALLBACK?['gemini']:configuredProviders();
+  const hasMedia=!!opts.mediaPart;
+  const providers=hasMedia?['gemini']:(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK?['gemini']:configuredProviders());
   const order=providers.length?providers:configuredProviders();
-  if(!order.length){await releaseAIQuota(opts.snapshot||{},uid);throw new Error('AI_NO_PROVIDER');}
+  if(!order.length){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
   let lastErr=null;
   for(const provider of order){
     try{
@@ -388,18 +515,110 @@ async function aiGenerate(uid,text,context,opts={}){
       return {answer:display,provider};
     }catch(e){lastErr=e;console.error('AI provider failed',provider,e.message);if(!shouldUseProviderFallback(e))break;}
   }
-  await releaseAIQuota(opts.snapshot||{},uid);
+  await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
+
 async function gemini(uid,text,context,opts={}){
   const r=await aiGenerate(uid,text,context,opts);return r.answer;
+}
+
+
+async function downloadLineContent(messageId,maxBytes){
+  const r=await fetch(`https://api-data.line.me/v2/bot/message/${encodeURIComponent(messageId)}/content`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});
+  if(!r.ok){
+    if(r.status===404||r.status===410)throw new Error('MEDIA_GONE');
+    throw new Error(`LINE content ${r.status}: ${await r.text()}`);
+  }
+  const ct=String(r.headers.get('content-type')||'application/octet-stream').split(';')[0].trim().toLowerCase();
+  const len=Number(r.headers.get('content-length')||0);
+  if(len>maxBytes)throw new Error('MEDIA_TOO_LARGE');
+  if(!r.body)throw new Error('MEDIA_EMPTY');
+  const reader=r.body.getReader();const chunks=[];let total=0;
+  try{
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      total+=value.byteLength;
+      if(total>maxBytes){await reader.cancel();throw new Error('MEDIA_TOO_LARGE');}
+      chunks.push(Buffer.from(value));
+    }
+  }finally{try{reader.releaseLock();}catch{}}
+  return {buffer:Buffer.concat(chunks),mimeType:ct,size:total};
+}
+function fileExtension(name){const m=String(name||'').toLowerCase().match(/\.([a-z0-9]+)$/);return m?m[1]:'';}
+function mediaUserMessage(kind,name){
+  if(kind==='image')return '請閱讀我剛傳送的圖片。若圖片包含題目，請先完整辨識題目，再用繁體中文提供清楚、可核對的解題步驟與答案；若無法辨識，請明確說明原因，不要猜測。';
+  return `請閱讀這份文件（${name||'未命名文件'}）。請根據文件實際內容回答問題；沒有出現在文件中的資訊不要自行補充或推測。若是題目，請提供清楚、可核對的步驟與答案。`;
+}
+async function handleMediaMessage(event,s,uid,lineName,settings){
+  const interaction=findInteraction(s,uid);
+  if(!(awake(s,uid)&&interaction?.mode==='AI客服模式')){
+    if(event.replyToken)await lineReply(event.replyToken,'請先從選單進入「④ AI客服」，再傳送圖片或文件。');
+    return;
+  }
+  const type=event.message?.type;
+  const id=event.message?.id;
+  if(!id){if(event.replyToken)await lineReply(event.replyToken,'目前無法取得附件內容，請重新傳送。');return;}
+  if(type==='image'){
+    const maxMB=settingsNumber(settings,'AI 圖片最大 MB','AI_MAX_IMAGE_MB',DEFAULT_MAX_IMAGE_MB);
+    const maxBytes=Math.floor(maxMB*1024*1024);
+    try{
+      await withMediaSlot(async()=>{
+        const media=await downloadLineContent(id,maxBytes);
+        if(!MEDIA_TYPES.has(media.mimeType))throw new Error('MEDIA_TYPE');
+        const prompt=mediaUserMessage('image','');
+        const b64=media.buffer.toString('base64');
+        const ans=await aiGenerate(uid,prompt,'這是一個圖片問答。不得使用任何未提供的圖片內容或猜測。',{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost:settingsNumber(settings,'AI 圖片額度','AI_IMAGE_COST',DEFAULT_IMAGE_COST),mediaBytes:media.size,mediaKind:'image',mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
+        if(event.replyToken)await lineReply(event.replyToken,ans.answer);
+        await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
+      });
+    }catch(e){
+      console.error('media image',e.message);
+      const msg=e.message==='AI_MEDIA_LIMIT'?'今日圖片／文件使用量已達上限，請稍後再試。':e.message==='MEDIA_TOO_LARGE'?`圖片超過系統限制 ${maxMB} MB，請壓縮或重新拍攝後再傳送。`:e.message==='MEDIA_TYPE'?'目前只支援 JPEG、PNG、WEBP、HEIC／HEIF 圖片。':e.message==='AI_LIMIT'?'本日 AI 額度不足；圖片需使用 2 次額度。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片目前無法處理，請稍後再試。';
+      if(event.replyToken)await lineReply(event.replyToken,msg);
+    }
+    return;
+  }
+  if(type==='file'){
+    const fileName=String(event.message?.fileName||'').trim();
+    const ext=fileExtension(fileName);
+    const declaredSize=Math.max(0,Number(event.message?.fileSize||0));
+    const maxMB=settingsNumber(settings,'AI 文件最大 MB','AI_MAX_DOCUMENT_MB',DEFAULT_MAX_DOCUMENT_MB);
+    const maxBytes=Math.floor(maxMB*1024*1024);
+    if(declaredSize>maxBytes){
+      if(event.replyToken)await lineReply(event.replyToken,`文件超過系統限制 ${maxMB} MB，目前只支援較小的文件以控制資源使用。`);
+      return;
+    }
+    if(ext!=='pdf'){
+      if(event.replyToken)await lineReply(event.replyToken,'目前文件問答先支援 PDF；DOCX／XLSX 等格式請先轉成 PDF 再傳送。');
+      return;
+    }
+    try{
+      await withMediaSlot(async()=>{
+        const media=await downloadLineContent(id,maxBytes);
+        if(media.mimeType!=='application/pdf')throw new Error('MEDIA_TYPE');
+        const prompt=mediaUserMessage('document',fileName);
+        const b64=media.buffer.toString('base64');
+        const ans=await aiGenerate(uid,prompt,'這是一個 PDF 文件問答。只能使用後端收到的 PDF 內容，不得猜測或補寫不存在的資訊。',{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost:settingsNumber(settings,'AI 文件額度','AI_DOCUMENT_COST',DEFAULT_DOCUMENT_COST),mediaBytes:media.size,mediaKind:'document',mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
+        if(event.replyToken)await lineReply(event.replyToken,ans.answer);
+        await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
+      });
+    }catch(e){
+      console.error('media file',e.message);
+      const msg=e.message==='AI_MEDIA_LIMIT'?'今日圖片／文件使用量已達上限，請稍後再試。':e.message==='MEDIA_TOO_LARGE'?`文件超過系統限制 ${maxMB} MB，請壓縮後再傳送。`:e.message==='MEDIA_TYPE'?'目前只支援 PDF 文件。':e.message==='AI_LIMIT'?'本日 AI 額度不足；文件需使用 3 次額度。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'文件目前無法處理，請稍後再試。';
+      if(event.replyToken)await lineReply(event.replyToken,msg);
+    }
+    return;
+  }
+  if(event.replyToken)await lineReply(event.replyToken,'目前只支援圖片與 PDF 文件問答。');
 }
 
 async function lineReply(token,text){const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages:[{type:'text',text:String(text).slice(0,4900)}]})});if(!r.ok)throw new Error(`LINE reply ${r.status}: ${await r.text()}`);}
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
 function sigOK(req){const sig=req.headers['x-line-signature'];if(!sig||!req.rawBody)return false;const digest=crypto.createHmac('sha256',LINE_SECRET).update(req.rawBody).digest('base64');try{return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(digest));}catch{return false;}}
 
-app.get('/health',(_req,res)=>res.json({ok:true,service:'line-frontend-customer-service-v2.0',aiProviders:AI_PROVIDER_ORDER.map(name=>({name,configured:providerReady(name),model:name==='gemini'?GEMINI_MODEL:name==='openrouter'?OPENROUTER_MODEL:GROQ_MODEL})),initialRebindMax:INITIAL_REBIND_MAX,bindGraceMinutes:BIND_GRACE_MINUTES,aiQuotaSheet:AI_QUOTA_SHEET,privateDataFallback:ALLOW_PRIVATE_AI_FALLBACK}));
+app.get('/health',(_req,res)=>res.json({ok:true,service:'line-frontend-customer-service-v2.1',aiProviders:AI_PROVIDER_ORDER.map(name=>({name,configured:providerReady(name),model:name==='gemini'?GEMINI_MODEL:name==='openrouter'?OPENROUTER_MODEL:GROQ_MODEL})),initialRebindMax:INITIAL_REBIND_MAX,bindGraceMinutes:BIND_GRACE_MINUTES,aiQuotaSheet:AI_QUOTA_SHEET,privateDataFallback:ALLOW_PRIVATE_AI_FALLBACK}));
 
 app.post('/webhook',async(req,res)=>{
   if(!sigOK(req))return res.status(401).send('Invalid signature');res.status(200).send('OK');
@@ -407,7 +626,16 @@ app.post('/webhook',async(req,res)=>{
     prev.then(async()=>{
       const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
       if(event.type==='follow'){await saveInteraction(s,uid,'安靜模式','');queueLog([nowTaipei(),uid,lineName,'follow','','',event.replyToken||'','安靜模式']);const sm=settingsMap(s);if(event.replyToken&&sm['加入好友歡迎訊息']!=='否'){const welcome=sm['加入好友歡迎訊息']||`您好，歡迎加入！\n\n如需服務，請輸入「${sm['喚醒關鍵詞']||'選單'}」。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;await lineReply(event.replyToken,welcome);}return;}
-      if(event.type!=='message'||event.message?.type!=='text')return;const text=String(event.message.text||'').trim();queueLog([nowTaipei(),uid,lineName,'message','text',text,event.replyToken||'','收到']);const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
+      if(event.type!=='message')return;
+      const messageType=String(event.message?.type||'');
+      const text=messageType==='text'?String(event.message.text||'').trim():'';
+      const mediaLog=messageType==='file'?String(event.message?.fileName||''):messageType;
+      queueLog([nowTaipei(),uid,lineName,'message',messageType,text||mediaLog,event.replyToken||'','收到']);
+      const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
+      if(messageType!=='text'){
+        if(messageType==='image'||messageType==='file'){await handleMediaMessage(event,s,uid,lineName,sm);}
+        return;
+      }
       if(text===kw||text==='功能選單'){await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,`您好，請選擇您要使用的功能：\n\n① LINE綁定\n② 課程查詢\n③ 繳費／收據\n④ AI客服\n⑤ 人工客服\n\n輸入「取消」可離開互動模式。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`);return;}
       if(text==='取消'||text==='取消互動'){clearHistory(uid);await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。\n\n如需服務，請輸入「選單」。');return;}
 
@@ -502,5 +730,5 @@ app.post('/webhook',async(req,res)=>{
 });
 
 app.listen(PORT,()=>console.log(`LINE customer service server v1.9.2 listening on ${PORT}`));
-(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
+(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));
