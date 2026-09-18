@@ -53,7 +53,7 @@ app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
 const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
 const logBuffer=[];let logTimer=null;
-const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map()};
+const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
 const mediaSemaphore={active:0,queue:[]};
 async function withAIQuotaLock(fn){const prev=aiQuotaLock.tail;let release;aiQuotaLock.tail=new Promise(r=>release=r);await prev;try{return await fn();}finally{release();}}
@@ -235,7 +235,7 @@ function formatCourseRows(rows){return rows.map((x,i)=>{const head=rows.length>1
 function courseQueryAsksUnsupportedInfo(text){return /(學習狀況|學習情況|成績|測驗|考試結果|表現|進度|出勤|缺課|評語|能力|排名)/.test(String(text||''));}
 function resetInMemoryQuota(q){
   const d=dayKey();
-  if(q.day!==d){q.day=d;q.total=0;q.users.clear();q.lastUse.clear();q.mediaBytesGlobal=0;q.mediaBytesUsers.clear();}
+  if(q.day!==d){q.day=d;q.total=0;q.users.clear();q.lastUse.clear();q.mediaBytesGlobal=0;q.mediaBytesUsers.clear();q.pendingMediaText.clear();q.pendingMedia.clear();}
 }
 async function withMediaSlot(fn){
   const limit=Math.max(1,Number(process.env.MEDIA_CONCURRENCY||DEFAULT_MEDIA_CONCURRENCY));
@@ -547,9 +547,53 @@ async function downloadLineContent(messageId,maxBytes){
   return {buffer:Buffer.concat(chunks),mimeType:ct,size:total};
 }
 function fileExtension(name){const m=String(name||'').toLowerCase().match(/\.([a-z0-9]+)$/);return m?m[1]:'';}
-function mediaUserMessage(kind,name){
-  if(kind==='image')return '請閱讀我剛傳送的圖片。若圖片包含題目，請先完整辨識題目，再用繁體中文提供清楚、可核對的解題步驟與答案；若無法辨識，請明確說明原因，不要猜測。';
-  return `請閱讀這份文件（${name||'未命名文件'}）。請根據文件實際內容回答問題；沒有出現在文件中的資訊不要自行補充或推測。若是題目，請提供清楚、可核對的步驟與答案。`;
+const MEDIA_COMBINE_WINDOW_MS=Math.max(5000,Number(process.env.AI_MEDIA_COMBINE_WINDOW_MS||60000));
+function looksLikeMediaInstruction(text){
+  const t=String(text||'').trim();
+  if(!t)return false;
+  return /(?:解題|解釋|分析|辨識|閱讀|看圖|圖片|照片|題目|作答|算出|說明這張|少於\s*\d+\s*字?|\d+\s*字以下|\d+字內|請先辨識|幫我解)/.test(t);
+}
+function setPendingMediaText(uid,text){
+  ai.pendingMediaText.set(uid,{text:String(text||'').trim(),at:Date.now()});
+}
+function takePendingMediaText(uid){
+  const x=ai.pendingMediaText.get(uid);
+  ai.pendingMediaText.delete(uid);
+  if(!x||Date.now()-x.at>MEDIA_COMBINE_WINDOW_MS)return '';
+  return x.text;
+}
+function setPendingMedia(uid,data){
+  ai.pendingMedia.set(uid,{...data,at:Date.now()});
+}
+function takePendingMedia(uid){
+  const x=ai.pendingMedia.get(uid);
+  ai.pendingMedia.delete(uid);
+  if(!x||Date.now()-x.at>MEDIA_COMBINE_WINDOW_MS)return null;
+  return x;
+}
+function mediaUserMessage(kind,name,instruction){
+  const base=kind==='image'
+    ?'請閱讀我剛傳送的圖片。若圖片包含題目，請先完整辨識題目，再回答。所有數字、公式、單位與選項都要以圖片中實際看得到的內容為準；圖片看不清楚的部分請明確標示，不要猜測或補寫不存在的內容。若圖片中的題目與一般背景知識有衝突，以圖片實際內容為準。'
+    :`請閱讀這份文件（${name||'未命名文件'}）。請根據文件實際內容回答問題。文件沒有提供的資訊不要自行補充或推測；若是題目，請提供清楚、可核對的步驟與答案。`;
+  const extra=String(instruction||'').trim();
+  const m=extra.match(/少於\s*(\d+)\s*字?|(?:不超過|最多|\b)\s*(\d+)\s*字(?:以下|內)?/i);
+  const limit=Number(m?.[1]||m?.[2]||0);
+  const limitText=limit>0?` 回答長度不得超過 ${limit} 個字。`:' 回答控制在 500 字以內。';
+  return extra?`${base}\n\n使用者同時提供的文字要求：${extra}\n請同時遵守這項文字要求。${limitText}`:`${base}\n請直接處理圖片／文件內容。${limitText}`;
+}
+function formatForLine(text){
+  let t=String(text??'');
+  t=t.replace(/\u00A0/g,' ').replace(/[\u200B-\u200D\uFEFF]/g,'');
+  t=t.replace(/```[a-zA-Z0-9_-]*\n?/g,'').replace(/```/g,'');
+  t=t.replace(/^#{1,6}\s*/gm,'');
+  t=t.replace(/\*\*([^*]+)\*\*/g,'$1').replace(/__([^_]+)__/g,'$1');
+  t=t.replace(/^\s*[*+-]\s+/gm,'・ ');
+  t=t.replace(/^\s*([0-9]+)\.\s+/gm,'$1. ');
+  t=t.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'$1');
+  t=t.replace(/\$([^$]+)\$/g,'$1');
+  t=t.replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+  if(t.length>4900)t=t.slice(0,4890)+'\n……';
+  return t;
 }
 async function handleMediaMessage(event,s,uid,lineName,settings){
   const interaction=findInteraction(s,uid);
@@ -561,13 +605,19 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
   const id=event.message?.id;
   if(!id){if(event.replyToken)await lineReply(event.replyToken,'目前無法取得附件內容，請重新傳送。');return;}
   if(type==='image'){
+    const instruction=takePendingMediaText(uid);
+    if(!instruction){
+      setPendingMedia(uid,{messageId:id,type:'image',fileName:'',fileSize:Number(event.message?.fileSize||0)});
+      if(event.replyToken)await lineReply(event.replyToken,'已收到圖片。請再告訴我希望我如何處理，例如「少於500字解釋」或「列出解題步驟」。');
+      return;
+    }
     const maxMB=settingsNumber(settings,'AI 圖片最大 MB','AI_MAX_IMAGE_MB',DEFAULT_MAX_IMAGE_MB);
     const maxBytes=Math.floor(maxMB*1024*1024);
     try{
       await withMediaSlot(async()=>{
         const media=await downloadLineContent(id,maxBytes);
         if(!MEDIA_TYPES.has(media.mimeType))throw new Error('MEDIA_TYPE');
-        const prompt=mediaUserMessage('image','');
+        const prompt=mediaUserMessage('image','',instruction);
         const b64=media.buffer.toString('base64');
         const ans=await aiGenerate(uid,prompt,'這是一個圖片問答。不得使用任何未提供的圖片內容或猜測。',{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost:settingsNumber(settings,'AI 圖片額度','AI_IMAGE_COST',DEFAULT_IMAGE_COST),mediaBytes:media.size,mediaKind:'image',mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
         if(event.replyToken)await lineReply(event.replyToken,ans.answer);
@@ -581,8 +631,14 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
     return;
   }
   if(type==='file'){
+    const instruction=takePendingMediaText(uid);
     const fileName=String(event.message?.fileName||'').trim();
     const ext=fileExtension(fileName);
+    if(!instruction){
+      setPendingMedia(uid,{messageId:id,type:'file',fileName,fileSize:Number(event.message?.fileSize||0)});
+      if(event.replyToken)await lineReply(event.replyToken,'已收到文件。請再告訴我希望我如何處理，例如「摘要」或「少於500字解釋」。');
+      return;
+    }
     const declaredSize=Math.max(0,Number(event.message?.fileSize||0));
     const maxMB=settingsNumber(settings,'AI 文件最大 MB','AI_MAX_DOCUMENT_MB',DEFAULT_MAX_DOCUMENT_MB);
     const maxBytes=Math.floor(maxMB*1024*1024);
@@ -598,7 +654,7 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
       await withMediaSlot(async()=>{
         const media=await downloadLineContent(id,maxBytes);
         if(media.mimeType!=='application/pdf')throw new Error('MEDIA_TYPE');
-        const prompt=mediaUserMessage('document',fileName);
+        const prompt=mediaUserMessage('document',fileName,instruction);
         const b64=media.buffer.toString('base64');
         const ans=await aiGenerate(uid,prompt,'這是一個 PDF 文件問答。只能使用後端收到的 PDF 內容，不得猜測或補寫不存在的資訊。',{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost:settingsNumber(settings,'AI 文件額度','AI_DOCUMENT_COST',DEFAULT_DOCUMENT_COST),mediaBytes:media.size,mediaKind:'document',mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
         if(event.replyToken)await lineReply(event.replyToken,ans.answer);
@@ -614,11 +670,36 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
   if(event.replyToken)await lineReply(event.replyToken,'目前只支援圖片與 PDF 文件問答。');
 }
 
-async function lineReply(token,text){const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages:[{type:'text',text:String(text).slice(0,4900)}]})});if(!r.ok)throw new Error(`LINE reply ${r.status}: ${await r.text()}`);}
+async function handleDeferredMediaWithText(event,s,uid,lineName,settings,pending,instruction){
+  const type=pending?.type,id=pending?.messageId;
+  if(!id)return;
+  const maxMB=type==='image'?settingsNumber(settings,'AI 圖片最大 MB','AI_MAX_IMAGE_MB',DEFAULT_MAX_IMAGE_MB):settingsNumber(settings,'AI 文件最大 MB','AI_MAX_DOCUMENT_MB',DEFAULT_MAX_DOCUMENT_MB);
+  const maxBytes=Math.floor(maxMB*1024*1024);
+  try{
+    await withMediaSlot(async()=>{
+      const media=await downloadLineContent(id,maxBytes);
+      if(type==='image'&&!MEDIA_TYPES.has(media.mimeType))throw new Error('MEDIA_TYPE');
+      if(type==='file'&&media.mimeType!=='application/pdf')throw new Error('MEDIA_TYPE');
+      const kind=type==='image'?'image':'document';
+      const cost=settingsNumber(settings,kind==='image'?'AI 圖片額度':'AI 文件額度',kind==='image'?'AI_IMAGE_COST':'AI_DOCUMENT_COST',kind==='image'?DEFAULT_IMAGE_COST:DEFAULT_DOCUMENT_COST);
+      const prompt=mediaUserMessage(kind,pending.fileName||'',instruction);
+      const b64=media.buffer.toString('base64');
+      const ans=await aiGenerate(uid,prompt,`這是一個${kind==='image'?'圖片':'PDF 文件'}問答。請嚴格依照使用者提供的${kind==='image'?'圖片':'文件'}與文字要求回答，不得猜測。`,{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost,mediaBytes:media.size,mediaKind:kind,mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
+      if(event.replyToken)await lineReply(event.replyToken,ans.answer);
+      await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
+    });
+  }catch(e){
+    console.error('deferred media',e.message);
+    const label=type==='image'?'圖片':'文件';
+    const msg=e.message==='AI_MEDIA_LIMIT'?`今日${label}／文件使用量已達上限，請稍後再試。`:e.message==='MEDIA_TOO_LARGE'?`${label}超過系統限制 ${maxMB} MB，請壓縮後再傳送。`:e.message==='MEDIA_TYPE'?(type==='image'?'目前只支援 JPEG、PNG、WEBP、HEIC／HEIF 圖片。':'目前只支援 PDF 文件。'):e.message==='AI_LIMIT'?`本日 AI 額度不足；${label}需使用 ${type==='image'?2:3} 次額度。`:e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片／文件目前無法處理，請稍後再試。';
+    if(event.replyToken)await lineReply(event.replyToken,msg);
+  }
+}
+async function lineReply(token,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE reply ${r.status}: ${await r.text()}`);}
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
 function sigOK(req){const sig=req.headers['x-line-signature'];if(!sig||!req.rawBody)return false;const digest=crypto.createHmac('sha256',LINE_SECRET).update(req.rawBody).digest('base64');try{return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(digest));}catch{return false;}}
 
-app.get('/health',(_req,res)=>res.json({ok:true,service:'line-frontend-customer-service-v2.1',aiProviders:AI_PROVIDER_ORDER.map(name=>({name,configured:providerReady(name),model:name==='gemini'?GEMINI_MODEL:name==='openrouter'?OPENROUTER_MODEL:GROQ_MODEL})),initialRebindMax:INITIAL_REBIND_MAX,bindGraceMinutes:BIND_GRACE_MINUTES,aiQuotaSheet:AI_QUOTA_SHEET,privateDataFallback:ALLOW_PRIVATE_AI_FALLBACK}));
+app.get('/health',(_req,res)=>res.json({ok:true,service:'line-frontend-customer-service-v2.2',aiProviders:AI_PROVIDER_ORDER.map(name=>({name,configured:providerReady(name),model:name==='gemini'?GEMINI_MODEL:name==='openrouter'?OPENROUTER_MODEL:GROQ_MODEL})),initialRebindMax:INITIAL_REBIND_MAX,bindGraceMinutes:BIND_GRACE_MINUTES,aiQuotaSheet:AI_QUOTA_SHEET,privateDataFallback:ALLOW_PRIVATE_AI_FALLBACK}));
 
 app.post('/webhook',async(req,res)=>{
   if(!sigOK(req))return res.status(401).send('Invalid signature');res.status(200).send('OK');
@@ -707,6 +788,12 @@ app.post('/webhook',async(req,res)=>{
       if(awake(s,uid)&&interaction?.mode==='AI客服模式'){
         try{
           const c=contactByUid(s,uid);const aiSettings=settingsMap(s);
+          const pending=takePendingMedia(uid);
+          if(pending){
+            if(text==='取消'){if(event.replyToken)await lineReply(event.replyToken,'已取消這次圖片／文件處理。');return;}
+            await handleDeferredMediaWithText(event,s,uid,lineName,sm,pending,text);
+            return;
+          }
           const deterministic=deterministicTimeAnswer(text);
           if(deterministic){
             if(event.replyToken)await lineReply(event.replyToken,deterministic);
@@ -715,6 +802,12 @@ app.post('/webhook',async(req,res)=>{
           }
           if(looksLikeCourseQuestion(text)||looksLikeBarePersonName(text)){
             if(event.replyToken)await lineReply(event.replyToken,'若您要查詢特定學生的上課時間、課程或老師，請從選單選擇「② 課程查詢」。課程查詢只會使用您已獲授權的資料。');
+            await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));
+            return;
+          }
+          if(looksLikeMediaInstruction(text)){
+            setPendingMediaText(uid,text);
+            if(event.replyToken)await lineReply(event.replyToken,`已記下您的要求：「${formatForLine(text)}」。請接著傳送圖片或 PDF 文件；收到後會把圖片／文件與這段要求一起交給 AI。`);
             await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));
             return;
           }

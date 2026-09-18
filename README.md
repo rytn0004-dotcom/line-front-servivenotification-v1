@@ -1,4 +1,4 @@
-# LINE 客服 V2.1：多通道 + 圖片／PDF + 資源控管
+# LINE 客服 V2.2：多通道 + 圖片／PDF + 資源控管
 
 ## 本版本新增
 - 一般文字 AI：1 次額度。
@@ -44,3 +44,5 @@ Render 環境變數也可提供同名 fallback。若 Google Sheet 已有數值�
 
 ## 既有多通道文字 AI
 Gemini → OpenRouter → Groq 的 fallback 保留；同一個文字問題只扣 1 次額度。
+
+V2.2 修正：LINE 圖片／PDF 與前後短時間內的文字要求會合併送入 Gemini；支援「少於500字解釋」等指示。LINE 回覆會移除 Markdown 標記與不可見空白，避免直接貼到 LINE 後出現異常排版。

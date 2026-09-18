@@ -1,6 +1,8 @@
-V2.1 建議部署：
+V2.2 建議部署：
 1. 上傳 server.js / package.json / README.md / .env.example / render.yaml。
 2. Render 保留原有必要環境變數。
 3. 若要使用多通道文字 AI，再設定 OPENROUTER_API_KEY / GROQ_API_KEY。
 4. 媒體資源上限可直接用 Render Environment Variables 控制；若 Google Sheet 系統設定已存在，Google Sheet 數值優先。
 5. 首次啟動會自動建立媒體相關系統設定與 AI額度管理 O/P 欄位。
+
+V2.2 修正：LINE 圖片／PDF 與前後短時間內的文字要求會合併送入 Gemini；支援「少於500字解釋」等指示。LINE 回覆會移除 Markdown 標記與不可見空白，避免直接貼到 LINE 後出現異常排版。
