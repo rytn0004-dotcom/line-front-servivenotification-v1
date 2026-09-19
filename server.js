@@ -10,11 +10,14 @@ const SHEET_ID=process.env.GOOGLE_SHEET_ID||'';
 const LINE_SECRET=process.env.LINE_CHANNEL_SECRET||'';
 const LINE_TOKEN=process.env.LINE_CHANNEL_ACCESS_TOKEN||'';
 const GEMINI_API_KEY=process.env.GEMINI_API_KEY||'';
+const GEMINI_API_KEY_B=process.env.GEMINI_API_KEY_B||'';
+const GEMINI_API_KEY_C=process.env.GEMINI_API_KEY_C||'';
 const GEMINI_MODEL_ORDER=String(process.env.GEMINI_MODEL_ORDER||'gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite').split(',').map(x=>x.trim()).filter(Boolean);
 const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
-const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||60000));
+const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
+const GEMINI_REQUEST_TIMEOUT_MS=Math.max(3000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||10000));
 const OPENROUTER_API_KEY=process.env.OPENROUTER_API_KEY||'';
 const OPENROUTER_MODEL=process.env.OPENROUTER_MODEL||'openrouter/free';
 const OPENROUTER_BASE_URL=process.env.OPENROUTER_BASE_URL||'https://openrouter.ai/api/v1/chat/completions';
@@ -57,7 +60,7 @@ app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
 const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
 const logBuffer=[];let logTimer=null;
-const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map()};
+const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map(),projectCooldowns:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
 const mediaSemaphore={active:0,queue:[]};
 async function withAIQuotaLock(fn){const prev=aiQuotaLock.tail;let release;aiQuotaLock.tail=new Promise(r=>release=r);await prev;try{return await fn();}finally{release();}}
@@ -407,7 +410,9 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
       }
     }
 
-    const cooldown=aiSettingNum(settings,'AI 呼叫冷卻秒數',2);
+    let cooldown=aiSettingNum(settings,'AI 呼叫冷卻秒數',3);
+    if(mediaKind==='image')cooldown=aiSettingNum(settings,'AI 圖片最小間隔秒數',5);
+    if(mediaKind==='document')cooldown=aiSettingNum(settings,'AI 文件最小間隔秒數',10);
     const lastSheet=parseTaipeiValue(um[uq.last]),lastMemory=ai.lastUse.get(uid)||0,last=Math.max(Number.isFinite(lastSheet)?lastSheet:0,lastMemory);
     if(last>0){const left=cooldown*1000-(Date.now()-last);if(left>0){const err=new Error('AI_COOLDOWN');err.remainingMs=left;throw err;}}
 
@@ -439,23 +444,40 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
   });
 }
 
+function geminiProjects(){
+  return [
+    {id:'A',key:GEMINI_API_KEY},
+    {id:'B',key:GEMINI_API_KEY_B},
+    {id:'C',key:GEMINI_API_KEY_C}
+  ].filter(x=>x.key&&GEMINI_MODEL_ORDER.length);
+}
 function providerReady(name){
-  if(name==='gemini')return !!GEMINI_API_KEY&&GEMINI_MODEL_ORDER.length>0;
+  if(name==='gemini')return geminiProjects().length>0;
   if(name==='openrouter')return !!OPENROUTER_API_KEY;
   if(name==='groq')return !!(GROQ_API_KEY&&GROQ_MODEL);
   return false;
 }
 function configuredProviders(){return AI_PROVIDER_ORDER.filter(providerReady);}
-function modelIsCooling(model){return Number(ai.modelCooldowns.get(model)||0)>Date.now();}
-function setModelCooldown(model,status,retryAfterMs=0){
+function cooldownKey(projectId,model){return `gemini:${projectId}:${model}`;}
+function modelIsCooling(projectId,model){return Number(ai.modelCooldowns.get(cooldownKey(projectId,model))||0)>Date.now();}
+function setModelCooldown(projectId,model,status,retryAfterMs=0){
   const code=Number(status||0);
   let duration=GEMINI_MODEL_COOLDOWN_MS;
   if([401,403,404].includes(code))duration=GEMINI_MODEL_LONG_COOLDOWN_MS;
   if(code===429&&retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
-  ai.modelCooldowns.set(model,Date.now()+duration);
+  ai.modelCooldowns.set(cooldownKey(projectId,model),Date.now()+duration);
 }
-function clearModelCooldown(model){ai.modelCooldowns.delete(model);}
-function geminiModelOrder(){return GEMINI_MODEL_ORDER.filter(m=>!modelIsCooling(m));}
+function clearModelCooldown(projectId,model){ai.modelCooldowns.delete(cooldownKey(projectId,model));}
+function projectIsCooling(projectId){return Number(ai.projectCooldowns.get(projectId)||0)>Date.now();}
+function setProjectCooldown(projectId,status,retryAfterMs=0){
+  const code=Number(status||0);
+  let duration=GEMINI_MODEL_COOLDOWN_MS;
+  if([401,403].includes(code))duration=GEMINI_MODEL_LONG_COOLDOWN_MS;
+  if(code===429&&retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
+  ai.projectCooldowns.set(projectId,Date.now()+duration);
+}
+function clearProjectCooldown(projectId){ai.projectCooldowns.delete(projectId);}
+function geminiModelOrder(projectId){return GEMINI_MODEL_ORDER.filter(m=>!modelIsCooling(projectId,m));}
 function isGeminiModelErrorMessage(msg){return /^Gemini\s+\d{3}\b/i.test(String(msg||''));}
 function historyToMessages(uid){
   return aiHistory(uid).map(x=>({role:x.role==='model'?'assistant':'user',content:String(x?.parts?.map(p=>p?.text||'').join('')||'')})).filter(x=>x.content);
@@ -478,15 +500,24 @@ async function callOpenAICompatible(provider,systemText,messages,maxOutputTokens
   let data;try{data=JSON.parse(raw);}catch{throw new Error(`${provider} invalid JSON`);}
   const answer=extractCompatAnswer(data);if(!answer)throw new Error(`${provider} empty`);return answer;
 }
-async function callGemini(model,systemText,contents,maxOutputTokens,temperature){
+async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTokens,temperature){
   const generationConfig={maxOutputTokens};
   if(/gemini-3\.(6|7|8)-flash$/.test(model)&&['low','medium','high'].includes(GEMINI_THINKING_LEVEL))generationConfig.thinkingConfig={thinkingLevel:GEMINI_THINKING_LEVEL};
   const body={systemInstruction:{parts:[{text:systemText}]},contents,generationConfig};
-  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const raw=await r.text();
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),GEMINI_REQUEST_TIMEOUT_MS);
+  let r;let raw='';
+  try{
+    r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});
+    raw=await r.text();
+  }catch(e){
+    const err=new Error(e?.name==='AbortError'?`Gemini timeout [${projectId}/${model}]`:`Gemini request failed [${projectId}/${model}]: ${e?.message||e}`);
+    err.code=e?.name==='AbortError'?408:502;err.model=model;err.projectId=projectId;throw err;
+  }finally{clearTimeout(timer);}
   const retryAfterHeader=Number(r.headers.get('retry-after')||0);
-  if(!r.ok){const e=new Error(`Gemini ${r.status} [${model}]: ${raw.slice(0,300)}`);e.code=r.status;e.model=model;e.retryAfterMs=retryAfterHeader>0?retryAfterHeader*1000:0;throw e;}
-  let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Gemini invalid JSON [${model}]`);e.code=500;e.model=model;throw e;}
-  const answer=String(data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();if(!answer){const e=new Error(`Gemini empty [${model}]`);e.code=502;e.model=model;throw e;}clearModelCooldown(model);return answer;
+  if(!r.ok){const e=new Error(`Gemini ${r.status} [${projectId}/${model}]: ${raw.slice(0,300)}`);e.code=r.status;e.model=model;e.projectId=projectId;e.retryAfterMs=retryAfterHeader>0?retryAfterHeader*1000:0;throw e;}
+  let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Gemini invalid JSON [${projectId}/${model}]`);e.code=500;e.model=model;e.projectId=projectId;throw e;}
+  const answer=String(data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();if(!answer){const e=new Error(`Gemini empty [${projectId}/${model}]`);e.code=502;e.model=model;e.projectId=projectId;throw e;}clearModelCooldown(projectId,model);clearProjectCooldown(projectId);return answer;
 }
 function errorCode(err){return Number(err?.code||String(err?.message||'').match(/\b(4\d\d|5\d\d)\b/)?.[1]||0);}
 function shouldUseProviderFallback(err){return [401,402,403,404,408,409,429,500,502,503,504].includes(errorCode(err));}
@@ -537,27 +568,35 @@ async function aiGenerate(uid,text,context,opts={}){
   const hasMedia=!!opts.mediaPart;
   const allowExternal=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
   const externalProviders=allowExternal?configuredProviders().filter(name=>name!=='gemini'):[];
-  const geminiModels=geminiModelOrder();
   if(!GEMINI_API_KEY&&geminiModels.length===0&&externalProviders.length===0){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
 
   let lastErr=null;
 
-  // 先輪替同一個 Gemini 專案內的多個模型；同一個使用者問題只預約／扣一次額度。
-  if(GEMINI_API_KEY&&geminiModels.length){
-    for(const model of geminiModels){
-      try{
-        const answer=await callGemini(model,systemText,geminiContents,q.maxOutputTokens,opts.temperature??0.2);
-        const display=String(answer).trim();
-        if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-        console.log('AI success',{channel:'gemini',model,uid});
-        return {answer:display,provider:`gemini:${model}`,model};
-      }catch(e){
-        lastErr=e;const code=errorCode(e);
-        if(shouldUseProviderFallback(e)&&[429,500,502,503,504,404,408,409,401,403].includes(code))setModelCooldown(model,code,e.retryAfterMs||0);
-        console.error('AI Gemini model failed',{model,code,message:e.message});
-        if(!shouldContinueGeminiModel(e)){
-          // 401/403 等專案／金鑰層級問題，不再對其餘 Gemini 模型逐一重試。
-          break;
+  // Gemini A→B→C：每個 Project 內依模型順序嘗試；同一個使用者問題只預約／扣一次額度。
+  const geminiProjectsList=geminiProjects();
+  if(geminiProjectsList.length){
+    for(const project of geminiProjectsList){
+      if(projectIsCooling(project.id))continue;
+      const projectModels=geminiModelOrder(project.id);
+      for(const model of projectModels){
+        try{
+          const answer=await callGemini(project.id,project.key,model,systemText,geminiContents,q.maxOutputTokens,opts.temperature??0.2);
+          const display=String(answer).trim();
+          if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
+          console.log('AI success',{channel:'gemini',project:project.id,model,uid});
+          return {answer:display,provider:`gemini:${project.id}:${model}`,model};
+        }catch(e){
+          lastErr=e;const code=errorCode(e);
+          if(code===429){
+            setProjectCooldown(project.id,code,e.retryAfterMs||0);
+            setModelCooldown(project.id,model,code,e.retryAfterMs||0);
+          }else if([401,403].includes(code)){
+            setProjectCooldown(project.id,code,e.retryAfterMs||0);
+          }else if([404,408,409,500,502,503,504].includes(code)){
+            setModelCooldown(project.id,model,code,e.retryAfterMs||0);
+          }
+          console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
+          if(code===429||[401,403].includes(code))break;
         }
       }
     }
