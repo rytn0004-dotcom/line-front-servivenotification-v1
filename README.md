@@ -1,4 +1,4 @@
-# LINE 客服 V2.4：Gemini 多模型自動切換 + 圖片／PDF + 資源控管
+# LINE 客服 V2.5：Gemini 多模型自動切換 + 圖片／PDF + 資源控管
 
 ## 本版本新增
 - 一般文字 AI：1 次額度。
@@ -48,7 +48,7 @@ Gemini → OpenRouter → Groq 的 fallback 保留；同一個文字問題只扣
 V2.2 修正：LINE 圖片／PDF 與前後短時間內的文字要求會合併送入 Gemini；支援「少於500字解釋」等指示。LINE 回覆會移除 Markdown 標記與不可見空白，避免直接貼到 LINE 後出現異常排版。
 
 
-## Gemini 多模型 Router（V2.4）
+## Gemini 多模型 Router（V2.5）
 - Gemini 目前可在同一個 Google 專案內依序嘗試：`gemini-3.8-flash` → `gemini-3.7-flash` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3.5-flash-lite`。官方目前將 3.8 Flash 列為最強的 Flash 模型；以上模型皆為目前 Gemini 3 穩定模型系列。
 - 3.8/3.7/3.6 發生 429、5xx、404 等可恢復／模型層級錯誤時，會暫時標記冷卻，避免每個新請求再次撞同一個失敗模型。
 - 401/403 等較可能屬於金鑰／專案權限問題時，不會把同一問題在所有 Gemini 模型上重試。
@@ -58,4 +58,7 @@ V2.2 修正：LINE 圖片／PDF 與前後短時間內的文字要求會合併送
 - `GEMINI_THINKING_LEVEL` 預設為 `low`，降低思考 token 消耗；可調整為 `medium` 或 `high`（3.6/3.7/3.8）。
 
 ## 重要：Google 配額
-AI Studio 畫面上的 RPM/TPM/RPD 額度仍由 Google 服務端控制，程式目前無法直接讀取「尚餘多少」的數字；V2.4 採「收到 429/服務錯誤後自動避開該模型」的方式做實際 fallback。若 Google 提供新的配額查詢 API，才適合再加主動式配額預判。
+AI Studio 畫面上的 RPM/TPM/RPD 額度仍由 Google 服務端控制，程式目前無法直接讀取「尚餘多少」的數字；V2.5 採「收到 429/服務錯誤後自動避開該模型」的方式做實際 fallback。若 Google 提供新的配額查詢 API，才適合再加主動式配額預判。
+
+## V2.5 內部資訊保護
+聊天介面不提供實際模型名稱、服務商、備援順序、API、Prompt、Render、GitHub、Google Sheet、資料庫或其他後端實作資訊。公開 `/health` 僅回覆 `ok:true`。
