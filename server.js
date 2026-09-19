@@ -10,7 +10,11 @@ const SHEET_ID=process.env.GOOGLE_SHEET_ID||'';
 const LINE_SECRET=process.env.LINE_CHANNEL_SECRET||'';
 const LINE_TOKEN=process.env.LINE_CHANNEL_ACCESS_TOKEN||'';
 const GEMINI_API_KEY=process.env.GEMINI_API_KEY||'';
-const GEMINI_MODEL=process.env.GEMINI_MODEL||'gemini-3.1-flash-lite';
+const GEMINI_MODEL_ORDER=String(process.env.GEMINI_MODEL_ORDER||'gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite').split(',').map(x=>x.trim()).filter(Boolean);
+const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
+const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
+const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||60000));
+const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
 const OPENROUTER_API_KEY=process.env.OPENROUTER_API_KEY||'';
 const OPENROUTER_MODEL=process.env.OPENROUTER_MODEL||'openrouter/free';
 const OPENROUTER_BASE_URL=process.env.OPENROUTER_BASE_URL||'https://openrouter.ai/api/v1/chat/completions';
@@ -53,7 +57,7 @@ app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
 const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
 const logBuffer=[];let logTimer=null;
-const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map()};
+const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
 const mediaSemaphore={active:0,queue:[]};
 async function withAIQuotaLock(fn){const prev=aiQuotaLock.tail;let release;aiQuotaLock.tail=new Promise(r=>release=r);await prev;try{return await fn();}finally{release();}}
@@ -422,12 +426,23 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
 }
 
 function providerReady(name){
-  if(name==='gemini')return !!GEMINI_API_KEY;
+  if(name==='gemini')return !!GEMINI_API_KEY&&GEMINI_MODEL_ORDER.length>0;
   if(name==='openrouter')return !!OPENROUTER_API_KEY;
   if(name==='groq')return !!(GROQ_API_KEY&&GROQ_MODEL);
   return false;
 }
 function configuredProviders(){return AI_PROVIDER_ORDER.filter(providerReady);}
+function modelIsCooling(model){return Number(ai.modelCooldowns.get(model)||0)>Date.now();}
+function setModelCooldown(model,status,retryAfterMs=0){
+  const code=Number(status||0);
+  let duration=GEMINI_MODEL_COOLDOWN_MS;
+  if([401,403,404].includes(code))duration=GEMINI_MODEL_LONG_COOLDOWN_MS;
+  if(code===429&&retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
+  ai.modelCooldowns.set(model,Date.now()+duration);
+}
+function clearModelCooldown(model){ai.modelCooldowns.delete(model);}
+function geminiModelOrder(){return GEMINI_MODEL_ORDER.filter(m=>!modelIsCooling(m));}
+function isGeminiModelErrorMessage(msg){return /^Gemini\s+\d{3}\b/i.test(String(msg||''));}
 function historyToMessages(uid){
   return aiHistory(uid).map(x=>({role:x.role==='model'?'assistant':'user',content:String(x?.parts?.map(p=>p?.text||'').join('')||'')})).filter(x=>x.content);
 }
@@ -449,14 +464,19 @@ async function callOpenAICompatible(provider,systemText,messages,maxOutputTokens
   let data;try{data=JSON.parse(raw);}catch{throw new Error(`${provider} invalid JSON`);}
   const answer=extractCompatAnswer(data);if(!answer)throw new Error(`${provider} empty`);return answer;
 }
-async function callGemini(systemText,contents,maxOutputTokens,temperature){
-  const body={systemInstruction:{parts:[{text:systemText}]},contents,generationConfig:{temperature,maxOutputTokens}};
-  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const raw=await r.text();
-  if(!r.ok)throw new Error(`Gemini ${r.status}: ${raw.slice(0,300)}`);
-  let data;try{data=JSON.parse(raw);}catch{throw new Error('Gemini invalid JSON');}
-  const answer=String(data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();if(!answer)throw new Error('Gemini empty');return answer;
+async function callGemini(model,systemText,contents,maxOutputTokens,temperature){
+  const generationConfig={maxOutputTokens};
+  if(/gemini-3\.(6|7|8)-flash$/.test(model)&&['low','medium','high'].includes(GEMINI_THINKING_LEVEL))generationConfig.thinkingConfig={thinkingLevel:GEMINI_THINKING_LEVEL};
+  const body={systemInstruction:{parts:[{text:systemText}]},contents,generationConfig};
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const raw=await r.text();
+  const retryAfterHeader=Number(r.headers.get('retry-after')||0);
+  if(!r.ok){const e=new Error(`Gemini ${r.status} [${model}]: ${raw.slice(0,300)}`);e.code=r.status;e.model=model;e.retryAfterMs=retryAfterHeader>0?retryAfterHeader*1000:0;throw e;}
+  let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Gemini invalid JSON [${model}]`);e.code=500;e.model=model;throw e;}
+  const answer=String(data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();if(!answer){const e=new Error(`Gemini empty [${model}]`);e.code=502;e.model=model;throw e;}clearModelCooldown(model);return answer;
 }
-function shouldUseProviderFallback(err){return /\b(?:401|402|403|404|408|409|429|500|502|503|504)\b/.test(String(err?.message||''));}
+function errorCode(err){return Number(err?.code||String(err?.message||'').match(/\b(4\d\d|5\d\d)\b/)?.[1]||0);}
+function shouldUseProviderFallback(err){return [401,402,403,404,408,409,429,500,502,503,504].includes(errorCode(err));}
+function shouldContinueGeminiModel(err){return [404,408,409,429,500,502,503,504].includes(errorCode(err));}
 
 function buildAIRequest(text,context,opts){
   const settings=opts.settings||{};const c=contactByUid(opts.snapshot||{},opts.uid||'')||null;const role=c?.role||opts.role||'未完成綁定';
@@ -501,20 +521,51 @@ async function aiGenerate(uid,text,context,opts={}){
   const {systemText,geminiContents,messages}=buildAIRequest(text,context,{...opts,uid});
   const privateContext=!!opts.privateData;
   const hasMedia=!!opts.mediaPart;
-  const providers=hasMedia?['gemini']:(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK?['gemini']:configuredProviders());
-  const order=providers.length?providers:configuredProviders();
-  if(!order.length){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
+  const allowExternal=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
+  const externalProviders=allowExternal?configuredProviders().filter(name=>name!=='gemini'):[];
+  const geminiModels=geminiModelOrder();
+  if(!GEMINI_API_KEY&&geminiModels.length===0&&externalProviders.length===0){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
+
   let lastErr=null;
-  for(const provider of order){
-    try{
-      let answer;
-      if(provider==='gemini')answer=await callGemini(systemText,geminiContents,q.maxOutputTokens,opts.temperature??0.2);
-      else answer=await callOpenAICompatible(provider,systemText,messages,q.maxOutputTokens,opts.temperature??0.2);
-      const display=`${answer}`.trim();
-      if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-      return {answer:display,provider};
-    }catch(e){lastErr=e;console.error('AI provider failed',provider,e.message);if(!shouldUseProviderFallback(e))break;}
+
+  // 先輪替同一個 Gemini 專案內的多個模型；同一個使用者問題只預約／扣一次額度。
+  if(GEMINI_API_KEY&&geminiModels.length){
+    for(const model of geminiModels){
+      try{
+        const answer=await callGemini(model,systemText,geminiContents,q.maxOutputTokens,opts.temperature??0.2);
+        const display=String(answer).trim();
+        if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
+        console.log('AI success',{channel:'gemini',model,uid});
+        return {answer:display,provider:`gemini:${model}`,model};
+      }catch(e){
+        lastErr=e;const code=errorCode(e);
+        if(shouldUseProviderFallback(e)&&[429,500,502,503,504,404,408,409,401,403].includes(code))setModelCooldown(model,code,e.retryAfterMs||0);
+        console.error('AI Gemini model failed',{model,code,message:e.message});
+        if(!shouldContinueGeminiModel(e)){
+          // 401/403 等專案／金鑰層級問題，不再對其餘 Gemini 模型逐一重試。
+          break;
+        }
+      }
+    }
   }
+
+  // 僅一般文字問題才使用 OpenRouter/Groq；私人資料與媒體維持原本隔離規則。
+  for(const provider of externalProviders){
+    try{
+      const answer=await callOpenAICompatible(provider,systemText,messages,q.maxOutputTokens,opts.temperature??0.2);
+      const display=String(answer).trim();
+      if(opts.saveHistory!==false&&opts.useHistory!==false){
+        const historyBase=aiHistory(uid);
+        ai.history.set(uid,[...historyBase,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
+      }
+      console.log('AI success',{channel:provider,uid});
+      return {answer:display,provider};
+    }catch(e){
+      lastErr=e;console.error('AI provider failed',provider,e.message);
+      if(!shouldUseProviderFallback(e))break;
+    }
+  }
+
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
@@ -729,7 +780,7 @@ async function lineReply(token,text){const display=formatForLine(text);const r=a
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
 function sigOK(req){const sig=req.headers['x-line-signature'];if(!sig||!req.rawBody)return false;const digest=crypto.createHmac('sha256',LINE_SECRET).update(req.rawBody).digest('base64');try{return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(digest));}catch{return false;}}
 
-app.get('/health',(_req,res)=>res.json({ok:true,service:'line-frontend-customer-service-v2.2',aiProviders:AI_PROVIDER_ORDER.map(name=>({name,configured:providerReady(name),model:name==='gemini'?GEMINI_MODEL:name==='openrouter'?OPENROUTER_MODEL:GROQ_MODEL})),initialRebindMax:INITIAL_REBIND_MAX,bindGraceMinutes:BIND_GRACE_MINUTES,aiQuotaSheet:AI_QUOTA_SHEET,privateDataFallback:ALLOW_PRIVATE_AI_FALLBACK}));
+app.get('/health',(_req,res)=>res.json({ok:true,service:'line-frontend-customer-service-v2.4',geminiModels:GEMINI_MODEL_ORDER.map(model=>({model,available:!modelIsCooling(model),cooldownUntil:ai.modelCooldowns.get(model)||null})),aiProviders:AI_PROVIDER_ORDER.map(name=>({name,configured:providerReady(name),model:name==='gemini'?GEMINI_MODEL_ORDER:name==='openrouter'?OPENROUTER_MODEL:GROQ_MODEL})),initialRebindMax:INITIAL_REBIND_MAX,bindGraceMinutes:BIND_GRACE_MINUTES,aiQuotaSheet:AI_QUOTA_SHEET,privateDataFallback:ALLOW_PRIVATE_AI_FALLBACK}));
 
 app.post('/webhook',async(req,res)=>{
   if(!sigOK(req))return res.status(401).send('Invalid signature');res.status(200).send('OK');
@@ -852,6 +903,6 @@ app.post('/webhook',async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v1.9.2 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.4 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));
