@@ -1,15 +1,6 @@
-V2.6 多 Project Gemini 部署重點
-
-Render 必要：
-- GEMINI_API_KEY = Project A 的 Key
-- GEMINI_API_KEY_B = Project B 的 Key（可選）
-- GEMINI_API_KEY_C = Project C 的 Key（可選）
-
-注意：A/B/C 必須對應不同 Google Cloud Project 才能形成真正的 Project 級備援。
-
-API Key 只能放 Render Environment Variables，不要放 GitHub、Excel 或前端。
-
-程式會依 Project A → B → C，並在每個 Project 內依模型順序嘗試。
-成功一次立即停止；不會把同一問題全部模型都跑過一次。
-
-若 3.8 發生 503 高需求，該 Project/模型會暫時 cooldown；使用者下一題可直接走其他可用 Project/模型。
+V2.7 部署重點
+1. Render Environment Variables 保留 GEMINI_API_KEY；若有獨立 Project 備援，可填 GEMINI_API_KEY_B、GEMINI_API_KEY_C。
+2. 建議 GEMINI_REQUEST_TIMEOUT_MS=60000。系統設定中的一般／圖片／PDF 最長等待時間分別預設 90／120／150 秒。
+3. AI 處理期間使用 LINE 原生 loading animation；處理超過 50 秒時會自動刷新。
+4. 媒體收到文字要求後先顯示「確認送出／修改要求／取消」，按確認後才呼叫 AI。
+5. 本 ZIP 不含 Excel；正式 Excel 另行提供。

@@ -17,7 +17,13 @@ const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
-const GEMINI_REQUEST_TIMEOUT_MS=Math.max(3000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||10000));
+const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||60000));
+const DEFAULT_AI_TEXT_WAIT_MS=60000;
+const DEFAULT_AI_IMAGE_WAIT_MS=90000;
+const DEFAULT_AI_DOCUMENT_WAIT_MS=120000;
+const AI_REPLY_SAFE_WINDOW_MS=50000;
+const LINE_LOADING_REFRESH_MS=50000;
+const ENABLE_GOOGLE_SEARCH=/^(1|true|yes|是)$/i.test(String(process.env.AI_ENABLE_GOOGLE_SEARCH||'true'));
 const OPENROUTER_API_KEY=process.env.OPENROUTER_API_KEY||'';
 const OPENROUTER_MODEL=process.env.OPENROUTER_MODEL||'openrouter/free';
 const OPENROUTER_BASE_URL=process.env.OPENROUTER_BASE_URL||'https://openrouter.ai/api/v1/chat/completions';
@@ -500,12 +506,14 @@ async function callOpenAICompatible(provider,systemText,messages,maxOutputTokens
   let data;try{data=JSON.parse(raw);}catch{throw new Error(`${provider} invalid JSON`);}
   const answer=extractCompatAnswer(data);if(!answer)throw new Error(`${provider} empty`);return answer;
 }
-async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTokens,temperature){
+async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTokens,temperature,opts={}){
   const generationConfig={maxOutputTokens};
   if(/gemini-3\.(6|7|8)-flash$/.test(model)&&['low','medium','high'].includes(GEMINI_THINKING_LEVEL))generationConfig.thinkingConfig={thinkingLevel:GEMINI_THINKING_LEVEL};
   const body={systemInstruction:{parts:[{text:systemText}]},contents,generationConfig};
+  if(opts.useSearch===true)body.tools=[{google_search:{}}];
   const controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(),GEMINI_REQUEST_TIMEOUT_MS);
+  const timeoutMs=Math.max(15000,Number(opts.timeoutMs||GEMINI_REQUEST_TIMEOUT_MS));
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
   let r;let raw='';
   try{
     r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});
@@ -517,7 +525,11 @@ async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTo
   const retryAfterHeader=Number(r.headers.get('retry-after')||0);
   if(!r.ok){const e=new Error(`Gemini ${r.status} [${projectId}/${model}]: ${raw.slice(0,300)}`);e.code=r.status;e.model=model;e.projectId=projectId;e.retryAfterMs=retryAfterHeader>0?retryAfterHeader*1000:0;throw e;}
   let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Gemini invalid JSON [${projectId}/${model}]`);e.code=500;e.model=model;e.projectId=projectId;throw e;}
-  const answer=String(data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();if(!answer){const e=new Error(`Gemini empty [${projectId}/${model}]`);e.code=502;e.model=model;e.projectId=projectId;throw e;}clearModelCooldown(projectId,model);clearProjectCooldown(projectId);return answer;
+  const candidate=data?.candidates?.[0]||{};
+  const answer=String(candidate?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();
+  if(!answer){const e=new Error(`Gemini empty [${projectId}/${model}]`);e.code=502;e.model=model;e.projectId=projectId;throw e;}
+  clearModelCooldown(projectId,model);clearProjectCooldown(projectId);
+  return {answer,finishReason:String(candidate?.finishReason||''),usageMetadata:data?.usageMetadata||null};
 }
 function errorCode(err){return Number(err?.code||String(err?.message||'').match(/\b(4\d\d|5\d\d)\b/)?.[1]||0);}
 function shouldUseProviderFallback(err){return [401,402,403,404,408,409,429,500,502,503,504].includes(errorCode(err));}
@@ -526,7 +538,8 @@ function shouldContinueGeminiModel(err){return [404,408,409,429,500,502,503,504]
 function buildAIRequest(text,context,opts){
   const settings=opts.settings||{};const c=contactByUid(opts.snapshot||{},opts.uid||'')||null;const role=c?.role||opts.role||'未完成綁定';
   const systemContext=`目前系統時間（${TZ}）：${nowTaipei()}\n使用者身分：${role}${context?`\n\n後端背景：${context}`:''}`;
-  const systemText=AI_PROMPT+'\n\n'+systemContext;
+  const searchNote=opts.useSearch===true?'\n此問題涉及較新的／即時資訊；若需要近期事實，請使用可用的 Google 搜尋工具核對後再回答。':' ';
+  const systemText=AI_PROMPT+'\n\n'+systemContext+searchNote;
   const userParts=[{text}];
   if(opts.mediaPart)userParts.push({inlineData:{mimeType:opts.mediaPart.mimeType,data:opts.mediaPart.dataBase64}});
   const geminiContents=opts.useHistory!==false?[...aiHistory(opts.uid||''),{role:'user',parts:userParts}]:[{role:'user',parts:userParts}];
@@ -560,65 +573,73 @@ async function releaseAIQuota(s,uid,usage={}){
 }
 
 
+
+function needsFreshWeb(text){
+  const t=String(text||'').trim();
+  return /(\b2026\b|今年|目前|現在|最新|最近|近期|本週|本月|這幾天|新推出|新發布|剛剛|最新版本|最新消息|現況|當前)/i.test(t);
+}
+function aiWaitMsFor(kind,settings){
+  if(kind==='image')return Math.max(15000,aiSettingNum(settings,'AI 圖片最長等待秒數',90)*1000);
+  if(kind==='document')return Math.max(15000,aiSettingNum(settings,'AI 文件最長等待秒數',120)*1000);
+  return Math.max(15000,aiSettingNum(settings,'AI 一般最長等待秒數',60)*1000);
+}
+function outputTokensFor(kind,settings){
+  if(kind==='image')return Math.max(200,aiSettingNum(settings,'AI 圖片回覆最大 Tokens',1000));
+  if(kind==='document')return Math.max(200,aiSettingNum(settings,'AI 文件回覆最大 Tokens',1200));
+  return Math.max(200,aiSettingNum(settings,'AI 回覆最大 Tokens',800));
+}
+
 async function aiGenerate(uid,text,context,opts={}){
   const settings=opts.settings||{};const c=contactByUid(opts.snapshot||{},uid)||null;const role=c?.role||opts.role||'未完成綁定';
-  const q=await reserveAIQuota(opts.snapshot||{},uid,opts.lineName||'',role,settings,text,{cost:opts.cost||1,mediaBytes:opts.mediaBytes||0,mediaKind:opts.mediaKind||''});
+  const mediaKind=String(opts.mediaKind||'').trim();
+  const waitMs=aiWaitMsFor(mediaKind,settings);
+  const deadline=Date.now()+waitMs;
+  const outputMax=outputTokensFor(mediaKind,settings);
+  const q=await reserveAIQuota(opts.snapshot||{},uid,opts.lineName||'',role,settings,text,{cost:opts.cost||1,mediaBytes:opts.mediaBytes||0,mediaKind:mediaKind});
   const {systemText,geminiContents,messages}=buildAIRequest(text,context,{...opts,uid});
   const privateContext=!!opts.privateData;
   const hasMedia=!!opts.mediaPart;
-  const allowExternal=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
+  const useSearch=!hasMedia&&!privateContext&&ENABLE_GOOGLE_SEARCH&&String(settings['AI 即時搜尋']||'是')!=='否'&&needsFreshWeb(text);
+  const allowExternal=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia && !useSearch;
   const externalProviders=allowExternal?configuredProviders().filter(name=>name!=='gemini'):[];
-  if(!GEMINI_API_KEY&&geminiModels.length===0&&externalProviders.length===0){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
-
+  if(geminiProjects().length===0&&externalProviders.length===0){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
   let lastErr=null;
-
-  // Gemini A→B→C：每個 Project 內依模型順序嘗試；同一個使用者問題只預約／扣一次額度。
   const geminiProjectsList=geminiProjects();
   if(geminiProjectsList.length){
-    for(const project of geminiProjectsList){
+    outer: for(const project of geminiProjectsList){
       if(projectIsCooling(project.id))continue;
       const projectModels=geminiModelOrder(project.id);
       for(const model of projectModels){
+        if(Date.now()>=deadline){const e=new Error(`Gemini overall timeout [${project.id}/${model}]`);e.code=408;e.model=model;e.projectId=project.id;lastErr=e;break outer;}
+        const remaining=deadline-Date.now();
+        const timeoutMs=Math.max(15000,Math.min(GEMINI_REQUEST_TIMEOUT_MS,remaining));
         try{
-          const answer=await callGemini(project.id,project.key,model,systemText,geminiContents,q.maxOutputTokens,opts.temperature??0.2);
-          const display=String(answer).trim();
+          const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch});
+          const display=String(result.answer).trim();
           if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-          console.log('AI success',{channel:'gemini',project:project.id,model,uid});
-          return {answer:display,provider:`gemini:${project.id}:${model}`,model};
+          console.log('AI success',{channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:useSearch});
+          return {answer:display,provider:`gemini:${project.id}:${model}`,model,finishReason:result.finishReason||'',usageMetadata:result.usageMetadata||null};
         }catch(e){
           lastErr=e;const code=errorCode(e);
-          if(code===429){
-            setProjectCooldown(project.id,code,e.retryAfterMs||0);
-            setModelCooldown(project.id,model,code,e.retryAfterMs||0);
-          }else if([401,403].includes(code)){
-            setProjectCooldown(project.id,code,e.retryAfterMs||0);
-          }else if([404,408,409,500,502,503,504].includes(code)){
-            setModelCooldown(project.id,model,code,e.retryAfterMs||0);
-          }
+          if(code===429){setProjectCooldown(project.id,code,e.retryAfterMs||0);setModelCooldown(project.id,model,code,e.retryAfterMs||0);}else if([401,403].includes(code)){setProjectCooldown(project.id,code,e.retryAfterMs||0);}else if([404,408,409,500,502,503,504].includes(code)){setModelCooldown(project.id,model,code,e.retryAfterMs||0);}
           console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
           if(code===429||[401,403].includes(code))break;
         }
       }
     }
   }
-
-  // 僅一般文字問題才使用 OpenRouter/Groq；私人資料與媒體維持原本隔離規則。
-  for(const provider of externalProviders){
-    try{
-      const answer=await callOpenAICompatible(provider,systemText,messages,q.maxOutputTokens,opts.temperature??0.2);
-      const display=String(answer).trim();
-      if(opts.saveHistory!==false&&opts.useHistory!==false){
-        const historyBase=aiHistory(uid);
-        ai.history.set(uid,[...historyBase,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-      }
-      console.log('AI success',{channel:provider,uid});
-      return {answer:display,provider};
-    }catch(e){
-      lastErr=e;console.error('AI provider failed',provider,e.message);
-      if(!shouldUseProviderFallback(e))break;
+  if(Date.now()<deadline){
+    for(const provider of externalProviders){
+      if(Date.now()>=deadline)break;
+      try{
+        const answer=await callOpenAICompatible(provider,systemText,messages,outputMax,opts.temperature??0.2);
+        const display=String(answer).trim();
+        if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
+        console.log('AI success',{channel:provider,uid});
+        return {answer:display,provider};
+      }catch(e){lastErr=e;console.error('AI provider failed',provider,e.message);if(!shouldUseProviderFallback(e))break;}
     }
   }
-
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
@@ -741,27 +762,12 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
   if(type==='image'){
     const instruction=takePendingMediaText(uid);
     if(!instruction){
-      setPendingMedia(uid,{messageId:id,type:'image',fileName:'',fileSize:Number(event.message?.fileSize||0)});
-      if(event.replyToken)await lineReply(event.replyToken,'已收到圖片。請再告訴我希望我如何處理，例如「少於500字解釋」或「列出解題步驟」。');
+      setPendingMedia(uid,{messageId:id,type:'image',fileName:'',fileSize:Number(event.message?.fileSize||0),editing:true,instruction:''});
+      if(event.replyToken)await lineReply(event.replyToken,'已收到圖片。請告訴我希望如何處理，例如「少於500字解釋」或「列出解題步驟」。');
       return;
     }
-    const maxMB=settingsNumber(settings,'AI 圖片最大 MB','AI_MAX_IMAGE_MB',DEFAULT_MAX_IMAGE_MB);
-    const maxBytes=Math.floor(maxMB*1024*1024);
-    try{
-      await withMediaSlot(async()=>{
-        const media=await downloadLineContent(id,maxBytes);
-        if(!MEDIA_TYPES.has(media.mimeType))throw new Error('MEDIA_TYPE');
-        const prompt=mediaUserMessage('image','',instruction);
-        const b64=media.buffer.toString('base64');
-        const ans=await aiGenerate(uid,prompt,'這是一個圖片問答。不得使用任何未提供的圖片內容或猜測。',{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost:settingsNumber(settings,'AI 圖片額度','AI_IMAGE_COST',DEFAULT_IMAGE_COST),mediaBytes:media.size,mediaKind:'image',mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
-        if(event.replyToken)await lineReply(event.replyToken,ans.answer);
-        await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
-      });
-    }catch(e){
-      console.error('media image',e.message);
-      const msg=e.message==='AI_MEDIA_LIMIT'?'今日圖片／文件使用量已達上限，請稍後再試。':e.message==='MEDIA_TOO_LARGE'?`圖片超過系統限制 ${maxMB} MB，請壓縮或重新拍攝後再傳送。`:e.message==='MEDIA_TYPE'?'目前只支援 JPEG、PNG、WEBP、HEIC／HEIF 圖片。':e.message==='AI_LIMIT'?'本日 AI 額度不足；圖片需使用 2 次額度。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片目前無法處理，請稍後再試。';
-      if(event.replyToken)await lineReply(event.replyToken,msg);
-    }
+    setPendingMedia(uid,{messageId:id,type:'image',fileName:'',fileSize:Number(event.message?.fileSize||0),instruction,awaitingConfirm:true});
+    if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到圖片與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。`,mediaConfirmQuickReply());
     return;
   }
   if(type==='file'){
@@ -769,8 +775,8 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
     const fileName=String(event.message?.fileName||'').trim();
     const ext=fileExtension(fileName);
     if(!instruction){
-      setPendingMedia(uid,{messageId:id,type:'file',fileName,fileSize:Number(event.message?.fileSize||0)});
-      if(event.replyToken)await lineReply(event.replyToken,'已收到文件。請再告訴我希望我如何處理，例如「摘要」或「少於500字解釋」。');
+      setPendingMedia(uid,{messageId:id,type:'file',fileName,fileSize:Number(event.message?.fileSize||0),editing:true,instruction:''});
+      if(event.replyToken)await lineReply(event.replyToken,'已收到文件。請告訴我希望如何處理，例如「摘要」或「少於500字解釋」。');
       return;
     }
     const declaredSize=Math.max(0,Number(event.message?.fileSize||0));
@@ -784,54 +790,98 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
       if(event.replyToken)await lineReply(event.replyToken,'目前文件問答先支援 PDF；DOCX／XLSX 等格式請先轉成 PDF 再傳送。');
       return;
     }
-    try{
-      await withMediaSlot(async()=>{
-        const media=await downloadLineContent(id,maxBytes);
-        if(media.mimeType!=='application/pdf')throw new Error('MEDIA_TYPE');
-        const prompt=mediaUserMessage('document',fileName,instruction);
-        const b64=media.buffer.toString('base64');
-        const ans=await aiGenerate(uid,prompt,'這是一個 PDF 文件問答。只能使用後端收到的 PDF 內容，不得猜測或補寫不存在的資訊。',{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost:settingsNumber(settings,'AI 文件額度','AI_DOCUMENT_COST',DEFAULT_DOCUMENT_COST),mediaBytes:media.size,mediaKind:'document',mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
-        if(event.replyToken)await lineReply(event.replyToken,ans.answer);
-        await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
-      });
-    }catch(e){
-      console.error('media file',e.message);
-      const msg=e.message==='AI_MEDIA_LIMIT'?'今日圖片／文件使用量已達上限，請稍後再試。':e.message==='MEDIA_TOO_LARGE'?`文件超過系統限制 ${maxMB} MB，請壓縮後再傳送。`:e.message==='MEDIA_TYPE'?'目前只支援 PDF 文件。':e.message==='AI_LIMIT'?'本日 AI 額度不足；文件需使用 3 次額度。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'文件目前無法處理，請稍後再試。';
-      if(event.replyToken)await lineReply(event.replyToken,msg);
-    }
+    setPendingMedia(uid,{messageId:id,type:'file',fileName,fileSize:declaredSize,instruction,awaitingConfirm:true});
+    if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到 PDF 與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。`,mediaConfirmQuickReply());
     return;
   }
   if(event.replyToken)await lineReply(event.replyToken,'目前只支援圖片與 PDF 文件問答。');
 }
 
 async function handleDeferredMediaWithText(event,s,uid,lineName,settings,pending,instruction){
-  const type=pending?.type,id=pending?.messageId;
-  if(!id)return;
-  const maxMB=type==='image'?settingsNumber(settings,'AI 圖片最大 MB','AI_MAX_IMAGE_MB',DEFAULT_MAX_IMAGE_MB):settingsNumber(settings,'AI 文件最大 MB','AI_MAX_DOCUMENT_MB',DEFAULT_MAX_DOCUMENT_MB);
-  const maxBytes=Math.floor(maxMB*1024*1024);
-  try{
-    await withMediaSlot(async()=>{
-      const media=await downloadLineContent(id,maxBytes);
-      if(type==='image'&&!MEDIA_TYPES.has(media.mimeType))throw new Error('MEDIA_TYPE');
-      if(type==='file'&&media.mimeType!=='application/pdf')throw new Error('MEDIA_TYPE');
-      const kind=type==='image'?'image':'document';
-      const cost=settingsNumber(settings,kind==='image'?'AI 圖片額度':'AI 文件額度',kind==='image'?'AI_IMAGE_COST':'AI_DOCUMENT_COST',kind==='image'?DEFAULT_IMAGE_COST:DEFAULT_DOCUMENT_COST);
-      const prompt=mediaUserMessage(kind,pending.fileName||'',instruction);
-      const b64=media.buffer.toString('base64');
-      const ans=await aiGenerate(uid,prompt,`這是一個${kind==='image'?'圖片':'PDF 文件'}問答。請嚴格依照使用者提供的${kind==='image'?'圖片':'文件'}與文字要求回答，不得猜測。`,{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost,mediaBytes:media.size,mediaKind:kind,mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
-      if(event.replyToken)await lineReply(event.replyToken,ans.answer);
-      await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
-    });
-  }catch(e){
-    console.error('deferred media',e.message);
-    const label=type==='image'?'圖片':'文件';
-    const msg=e.message==='AI_MEDIA_LIMIT'?`今日${label}／文件使用量已達上限，請稍後再試。`:e.message==='MEDIA_TOO_LARGE'?`${label}超過系統限制 ${maxMB} MB，請壓縮後再傳送。`:e.message==='MEDIA_TYPE'?(type==='image'?'目前只支援 JPEG、PNG、WEBP、HEIC／HEIF 圖片。':'目前只支援 PDF 文件。'):e.message==='AI_LIMIT'?`本日 AI 額度不足；${label}需使用 ${type==='image'?2:3} 次額度。`:e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片／文件目前無法處理，請稍後再試。';
-    if(event.replyToken)await lineReply(event.replyToken,msg);
-  }
+  const type=pending?.type;
+  if(!pending?.messageId)return;
+  if(!String(instruction||'').trim()){if(event.replyToken)await lineReply(event.replyToken,'請告訴我希望如何處理這份圖片／文件。');return;}
+  setPendingMedia(uid,{...pending,instruction:String(instruction).trim(),editing:false,awaitingConfirm:true});
+  const label=type==='image'?'圖片':'PDF';
+  if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到${label}與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。`,mediaConfirmQuickReply());
 }
-async function lineReply(token,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE reply ${r.status}: ${await r.text()}`);}
+
+async function lineReplyPayload(token,messages){
+  const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages})});
+  if(!r.ok)throw new Error(`LINE reply ${r.status}: ${await r.text()}`);
+}
+async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
+async function lineReplyQuick(token,text,items){await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
+async function linePush(uid,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
+async function lineLoading(uid,seconds=60){const r=await fetch('https://api.line.me/v2/bot/chat/loading/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({chatId:uid,loadingSeconds:Math.min(60,Math.max(5,Math.round(seconds/5)*5))})});if(!r.ok)throw new Error(`LINE loading ${r.status}: ${await r.text()}`);}
+async function withLineLoading(uid,waitMs,fn){
+  let stopped=false;
+  const refresh=async()=>{if(stopped)return;try{await lineLoading(uid,60);}catch(e){console.warn('LINE loading animation',e.message);}};
+  await refresh();
+  const timer=setInterval(()=>{void refresh();},LINE_LOADING_REFRESH_MS);
+  try{return await fn();}finally{stopped=true;clearInterval(timer);}
+}
+async function replyOrPush(event,uid,text,startedAt){
+  if(event?.replyToken&&Date.now()-startedAt<AI_REPLY_SAFE_WINDOW_MS){
+    try{await lineReply(event.replyToken,text);return;}catch(e){console.warn('LINE reply failed, fallback to push',e.message);}
+  }
+  await linePush(uid,text);
+}
+
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
 function sigOK(req){const sig=req.headers['x-line-signature'];if(!sig||!req.rawBody)return false;const digest=crypto.createHmac('sha256',LINE_SECRET).update(req.rawBody).digest('base64');try{return crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(digest));}catch{return false;}}
+
+
+function mediaConfirmQuickReply(){return [
+  {label:'確認送出',data:'action=media_confirm',displayText:'確認送出'},
+  {label:'修改要求',data:'action=media_edit',displayText:'修改要求'},
+  {label:'取消',data:'action=media_cancel',displayText:'取消'}
+];}
+async function handleMediaPostback(event,s,uid,lineName,sm){
+  const data=String(event.postback?.data||'');
+  if(!/^action=media_(confirm|edit|cancel)$/.test(data))return false;
+  const pending=takePendingMedia(uid);
+  if(!pending){if(event.replyToken)await lineReply(event.replyToken,'這次圖片／文件處理要求已逾時或已完成，請重新傳送。');return true;}
+  if(data==='action=media_cancel'){if(event.replyToken)await lineReply(event.replyToken,'已取消這次圖片／文件處理。');return true;}
+  if(data==='action=media_edit'){
+    setPendingMedia(uid,{...pending,editing:true,instruction:''});
+    if(event.replyToken)await lineReply(event.replyToken,'請重新輸入這次圖片／文件的處理要求。輸入後會再次顯示確認按鈕。');
+    return true;
+  }
+  const instruction=String(pending.instruction||'').trim();
+  if(!instruction){setPendingMedia(uid,{...pending,editing:true,instruction:''});if(event.replyToken)await lineReply(event.replyToken,'請先輸入希望如何處理這份圖片／文件，例如「少於500字解釋」或「列出解題步驟」。');return true;}
+  await saveInteraction(s,uid,'AI客服模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
+  const startedAt=Date.now();
+  const kind=pending.type==='image'?'image':'document';
+  const waitMs=aiWaitMsFor(kind,sm);
+  try{
+    await processPendingMediaConfirmed(event,s,uid,lineName,sm,pending,instruction,startedAt);
+  }catch(e){
+    console.error('media postback confirm',e.message);
+    const msg=e.message==='AI_MEDIA_LIMIT'?`今日${kind==='image'?'圖片':'文件'}使用量已達上限，請稍後再試。`:e.message==='MEDIA_TOO_LARGE'?`${kind==='image'?'圖片':'文件'}超過系統限制，請壓縮後再傳送。`:e.message==='AI_LIMIT'?`本日 AI 額度不足；${kind==='image'?'圖片需使用 2 次':'文件需使用 3 次'}額度。`:e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片／文件目前無法處理，請稍後再試。';
+    try{await replyOrPush(event,uid,msg,startedAt);}catch(pushErr){console.error('media postback send failed',pushErr.message);}
+  }
+  return true;
+}
+async function processPendingMediaConfirmed(event,s,uid,lineName,settings,pending,instruction,startedAt){
+  const type=pending.type,id=pending.messageId;
+  const maxMB=type==='image'?settingsNumber(settings,'AI 圖片最大 MB','AI_MAX_IMAGE_MB',DEFAULT_MAX_IMAGE_MB):settingsNumber(settings,'AI 文件最大 MB','AI_MAX_DOCUMENT_MB',DEFAULT_MAX_DOCUMENT_MB);
+  const maxBytes=Math.floor(maxMB*1024*1024);
+  await withMediaSlot(async()=>{
+    const media=await downloadLineContent(id,maxBytes);
+    if(type==='image'&&!MEDIA_TYPES.has(media.mimeType))throw new Error('MEDIA_TYPE');
+    if(type==='file'&&media.mimeType!=='application/pdf')throw new Error('MEDIA_TYPE');
+    const kind=type==='image'?'image':'document';
+    const cost=settingsNumber(settings,kind==='image'?'AI 圖片額度':'AI 文件額度',kind==='image'?'AI_IMAGE_COST':'AI_DOCUMENT_COST',kind==='image'?DEFAULT_IMAGE_COST:DEFAULT_DOCUMENT_COST);
+    const prompt=mediaUserMessage(kind,pending.fileName||'',instruction);
+    const b64=media.buffer.toString('base64');
+    const run=()=>aiGenerate(uid,prompt,`這是一個${kind==='image'?'圖片':'PDF 文件'}問答。請嚴格依照使用者提供的${kind==='image'?'圖片':'文件'}與文字要求回答，不得猜測。`,{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost,mediaBytes:media.size,mediaKind:kind,mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
+    const ans=await withLineLoading(uid,aiWaitMsFor(kind,settings),run);
+    const finalText=ans.finishReason==='MAX_TOKENS'?`${ans.answer}\n\n（回答已接近系統長度上限，已盡量完整整理。）`:ans.answer;
+    await replyOrPush(event,uid,finalText,startedAt);
+    await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
+  });
+}
 
 app.get('/health',(_req,res)=>res.json({ok:true}));
 
@@ -841,12 +891,13 @@ app.post('/webhook',async(req,res)=>{
     prev.then(async()=>{
       const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
       if(event.type==='follow'){await saveInteraction(s,uid,'安靜模式','');queueLog([nowTaipei(),uid,lineName,'follow','','',event.replyToken||'','安靜模式']);const sm=settingsMap(s);if(event.replyToken&&sm['加入好友歡迎訊息']!=='否'){const welcome=sm['加入好友歡迎訊息']||`您好，歡迎加入！\n\n如需服務，請輸入「${sm['喚醒關鍵詞']||'選單'}」。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;await lineReply(event.replyToken,welcome);}return;}
+      const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
+      if(event.type==='postback'){await handleMediaPostback(event,s,uid,lineName,sm);return;}
       if(event.type!=='message')return;
       const messageType=String(event.message?.type||'');
       const text=messageType==='text'?String(event.message.text||'').trim():'';
       const mediaLog=messageType==='file'?String(event.message?.fileName||''):messageType;
       queueLog([nowTaipei(),uid,lineName,'message',messageType,text||mediaLog,event.replyToken||'','收到']);
-      const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
       if(messageType!=='text'){
         if(messageType==='image'||messageType==='file'){await handleMediaMessage(event,s,uid,lineName,sm);}
         return;
@@ -867,10 +918,10 @@ app.post('/webhook',async(req,res)=>{
       }
       if(text==='2'||text==='課程查詢'){
         const aiIdle=Number(sm['AI 對話閒置分鐘數']||25)||25;
-        const c=contactByUid(s,uid);if(!c||c.status!=='已綁定'){if(event.replyToken)await lineReply(event.replyToken,'課程查詢需要先完成 LINE 綁定。');return;}if(c.permission!=='是'){if(event.replyToken)await lineReply(event.replyToken,'您的課表查詢權限尚未開啟。綁定已完成，但需管理員在後台確認後才能查詢。');return;}if(!GEMINI_API_KEY){if(event.replyToken)await lineReply(event.replyToken,'課程查詢 AI 尚未設定，請使用人工客服。');return;}await saveInteraction(s,uid,'AI課程查詢模式',taipei(aiIdle*60000));clearHistory(uid);if(event.replyToken)await lineReply(event.replyToken,'已進入課程查詢。\n\n例如：「我小孩星期六幾點上課？」\n\n系統只會使用您已授權的課程資料。');return;
+        const c=contactByUid(s,uid);if(!c||c.status!=='已綁定'){if(event.replyToken)await lineReply(event.replyToken,'課程查詢需要先完成 LINE 綁定。');return;}if(c.permission!=='是'){if(event.replyToken)await lineReply(event.replyToken,'您的課表查詢權限尚未開啟。綁定已完成，但需管理員在後台確認後才能查詢。');return;}if(geminiProjects().length===0&&configuredProviders().length===0){if(event.replyToken)await lineReply(event.replyToken,'課程查詢 AI 尚未設定，請使用人工客服。');return;}await saveInteraction(s,uid,'AI課程查詢模式',taipei(aiIdle*60000));clearHistory(uid);if(event.replyToken)await lineReply(event.replyToken,'已進入課程查詢。\n\n例如：「我小孩星期六幾點上課？」\n\n系統只會使用您已授權的課程資料。');return;
       }
       if(text==='3'||text==='繳費／收據'||text==='繳費/收據'){if(event.replyToken)await lineReply(event.replyToken,'目前繳費／收據服務尚未啟用，請使用人工客服。');return;}
-      if(text==='4'||text==='AI客服'||text==='AI 客服'){const aiIdle=Number(sm['AI 對話閒置分鐘數']||25)||25;if(!GEMINI_API_KEY){if(event.replyToken)await lineReply(event.replyToken,'AI 客服尚未設定 Gemini API Key，目前請使用人工客服。');return;}clearHistory(uid);await saveInteraction(s,uid,'AI客服模式',taipei(aiIdle*60000));if(event.replyToken)await lineReply(event.replyToken,'已進入 AI 客服。請直接輸入您的問題。\n\n輸入「取消」可離開。');return;}
+      if(text==='4'||text==='AI客服'||text==='AI 客服'){const aiIdle=Number(sm['AI 對話閒置分鐘數']||25)||25;if(geminiProjects().length===0&&configuredProviders().length===0){if(event.replyToken)await lineReply(event.replyToken,'AI 客服尚未設定可用的 AI 通道，目前請使用人工客服。');return;}clearHistory(uid);await saveInteraction(s,uid,'AI客服模式',taipei(aiIdle*60000));if(event.replyToken)await lineReply(event.replyToken,'已進入 AI 客服。請直接輸入您的問題。\n\n輸入「取消」可離開。');return;}
       if(text==='5'||text==='人工客服'){clearHistory(uid);await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,'已進入人工客服服務，請直接留言。');return;}
 
       const interaction=findInteraction(s,uid),b=findBinding(s,uid),status=b?.status||'UNBOUND';
@@ -911,8 +962,8 @@ app.post('/webhook',async(req,res)=>{
           const aiContext=`這是課程查詢模式。身分：${q.role}。後端已先依 LINE User ID、綁定資料與「課表查詢權限」過濾。只能使用下面這些實際存在的資料。不得使用一般聊天記憶，不得擴大範圍。資料欄位只有：日期、星期、上課時間、學生、課程、老師、校區、備註。\n\n後端已授權課程資料：\n${exact}`;
           if(!GEMINI_API_KEY){if(event.replyToken)await lineReply(event.replyToken,`目前課程查詢 AI 暫時無法使用，以下提供後端查到的授權課表資料：\n\n${exact}`);return;}
           try{
-            const courseSettings=settingsMap(s);const ans=await gemini(uid,`請依照上述後端資料回答這個課程查詢：${text}`,aiContext,{useHistory:false,saveHistory:false,temperature:0.05,settings:courseSettings,snapshot:s,lineName,role:q.role,privateData:true});
-            if(event.replyToken)await lineReply(event.replyToken,ans);await saveInteraction(s,uid,'AI課程查詢模式',taipei(Number(courseSettings['AI 對話閒置分鐘數']||25)*60000));
+            const courseSettings=settingsMap(s);const startedAt=Date.now();const ans=await withLineLoading(uid,aiWaitMsFor('text',courseSettings),()=>gemini(uid,`請依照上述後端資料回答這個課程查詢：${text}`,aiContext,{useHistory:false,saveHistory:false,temperature:0.05,settings:courseSettings,snapshot:s,lineName,role:q.role,privateData:true}));
+            await replyOrPush(event,uid,ans,startedAt);await saveInteraction(s,uid,'AI課程查詢模式',taipei(Number(courseSettings['AI 對話閒置分鐘數']||25)*60000));
           }catch(aiErr){
             console.error('course gemini',aiErr.message);
             if(event.replyToken)await lineReply(event.replyToken,`AI 文字整理目前暫時無法使用。為避免猜測，以下提供後端查到的授權課表資料：\n\n${exact}`);
@@ -921,6 +972,7 @@ app.post('/webhook',async(req,res)=>{
       }
 
       if(awake(s,uid)&&interaction?.mode==='AI客服模式'){
+        const aiStartedAt=Date.now();
         try{
           const c=contactByUid(s,uid);const aiSettings=settingsMap(s);
           const pending=takePendingMedia(uid);
@@ -947,16 +999,16 @@ app.post('/webhook',async(req,res)=>{
             return;
           }
           if(String(text).length>aiSettingNum(aiSettings,'單次輸入最大字數',300)){throw Object.assign(new Error('AI_INPUT_LIMIT'),{});}
-          const ans=await gemini(uid,text,`身分：${c?.role||'未完成綁定'}。若問題不是補習班私有資料，可正常回答。`,{settings:aiSettings,snapshot:s,lineName,role:c?.role});
-          if(event.replyToken)await lineReply(event.replyToken,ans);
+          const startedAt=Date.now();const ans=await withLineLoading(uid,aiWaitMsFor('text',aiSettings),()=>gemini(uid,text,`身分：${c?.role||'未完成綁定'}。若問題不是補習班私有資料，可正常回答。`,{settings:aiSettings,snapshot:s,lineName,role:c?.role}));
+          await replyOrPush(event,uid,ans,startedAt);
           await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));
-        }catch(e){console.error('ai',e.message);if(event.replyToken)await lineReply(event.replyToken,e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。');}
+        }catch(e){console.error('ai',e.message);const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。';try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt);}catch(sendErr){console.error('ai error send',sendErr.message);}}
         return;
       }
     }).catch(e=>console.error('event',e)).finally(()=>{release();if(cache.locks.get(uid)===current)cache.locks.delete(uid);});
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v2.5 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.7 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

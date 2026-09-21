@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: line-frontend-customer-service-v2
+    name: line-frontend-customer-service-v2-7
     env: node
     buildCommand: npm install
     startCommand: node server.js
