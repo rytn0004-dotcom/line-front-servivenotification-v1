@@ -1,6 +1,9 @@
 require('dotenv').config();
 const express=require('express');
 const crypto=require('crypto');
+const fs=require('fs');
+const path=require('path');
+const sharp=require('sharp');
 const {google}=require('googleapis');
 
 const app=express();
@@ -41,6 +44,15 @@ const DEFAULT_MAX_GLOBAL_MEDIA_MB=300;
 const DEFAULT_MEDIA_CONCURRENCY=1;
 const MEDIA_TYPES=new Set(['image/jpeg','image/png','image/webp','image/heic','image/heif']);
 const DOCUMENT_TYPES=new Set(['application/pdf']);
+const IMAGE_GEN_DEFAULT_MODEL='@cf/black-forest-labs/flux-1-schnell';
+const DEFAULT_IMAGE_GEN_DAILY_USER_LIMIT=2;
+const DEFAULT_IMAGE_GEN_DAILY_GLOBAL_LIMIT=20;
+const DEFAULT_IMAGE_GEN_STEPS=4;
+const DEFAULT_IMAGE_GEN_MAX_WAIT_MS=90000;
+const DEFAULT_IMAGE_GEN_CONCURRENCY=1;
+const DEFAULT_GENERATED_IMAGE_TTL_MS=15*60*1000;
+const GENERATED_IMAGE_DIR=process.env.GENERATED_IMAGE_DIR||path.join('/tmp','line-customer-generated-images');
+const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').replace(/\/$/,'');
 const MEDIA_RESOURCE_SHEET_COLUMNS={bytes:14,date:15}; // O/P; keep G/H formulas untouched.
 const MEDIA_UPLOAD_TEMP_DIR=process.env.MEDIA_UPLOAD_TEMP_DIR||'/tmp/line-customer-media';
 const AI_MAX_HISTORY_TURNS=Math.max(1,Number(process.env.AI_MAX_HISTORY_TURNS||6));
@@ -66,7 +78,7 @@ app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
 const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
 const logBuffer=[];let logTimer=null;
-const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map(),projectCooldowns:new Map()};
+const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map(),projectCooldowns:new Map(),imageGenFlows:new Map(),imageGenCountGlobal:0,imageGenCountUsers:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
 const mediaSemaphore={active:0,queue:[]};
 async function withAIQuotaLock(fn){const prev=aiQuotaLock.tail;let release;aiQuotaLock.tail=new Promise(r=>release=r);await prev;try{return await fn();}finally{release();}}
@@ -90,7 +102,7 @@ async function readSnapshot(force=false){
   if(!force&&cache.snapshot&&cache.expiresAt>Date.now())return cache.snapshot;
   if(cache.inFlight)return cache.inFlight;
   cache.inFlight=retry('snapshot',async()=>{
-    const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:P`];
+    const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:R`];
     const r=await sheets.spreadsheets.values.batchGet({spreadsheetId:SHEET_ID,ranges,majorDimension:'ROWS'});
     const contacts=r.data.valueRanges?.[0]?.values||[],courses=r.data.valueRanges?.[4]?.values||[],reviews=r.data.valueRanges?.[5]?.values||[],aiQuotas=r.data.valueRanges?.[6]?.values||[];
     return {contacts,contactsHeaderRow:headerRow(contacts,['姓名','身分','學生姓名/關聯（可多位）','LINE User ID','課表查詢權限']),bindings:r.data.valueRanges?.[1]?.values||[],interactions:r.data.valueRanges?.[2]?.values||[],settings:r.data.valueRanges?.[3]?.values||[],settingsHeaderRow:headerRow(r.data.valueRanges?.[3]?.values||[],['設定項目','目前值']),courses,coursesHeaderRow:headerRow(courses,['Course ID','學生','上課時間']),reviews,reviewsHeaderRow:headerRow(reviews,['申請時間','LINE User ID','申請狀態']),aiQuotas,aiQuotasHeaderRow:headerRow(aiQuotas,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期'])};
@@ -142,7 +154,7 @@ async function ensureMediaSettings(){
   return add.length;
 }
 async function ensureAIQuotaMediaColumns(){
-  const r=await retry('AI quota media schema',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(AI_QUOTA_SHEET)}!A:P`,majorDimension:'ROWS'}));
+  const r=await retry('AI quota media schema',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(AI_QUOTA_SHEET)}!A:R`,majorDimension:'ROWS'}));
   const rows=r.data.values||[];
   const h=headerRow(rows,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期']);
   if(h<0)throw new Error('AI額度管理找不到標準標題列。');
@@ -150,11 +162,16 @@ async function ensureAIQuotaMediaColumns(){
   const updates=[];
   if(String(header[14]||'').trim()!=='今日媒體 MB')updates.push({range:`O${h+1}`,values:[['今日媒體 MB']]});
   if(String(header[15]||'').trim()!=='媒體額度日期')updates.push({range:`P${h+1}`,values:[['媒體額度日期']]});
+  if(String(header[16]||'').trim()!=='今日生圖次數')updates.push({range:`Q${h+1}`,values:[['今日生圖次數']]});
+  if(String(header[17]||'').trim()!=='生圖額度日期')updates.push({range:`R${h+1}`,values:[['生圖額度日期']]});
   for(const u of updates)await update(AI_QUOTA_SHEET,u.range,u.values);
-  if(rows.length>h+1){
-    const data=rows.slice(h+1).map(r=>[String(r?.[14]||'').trim(),String(r?.[15]||'').trim()]);
-    const normalized=data.map((r)=>[r[0]||'0',r[1]||dayKey()]);
-    await update(AI_QUOTA_SHEET,`O${h+2}:P${rows.length}`,normalized);
+  for(let i=h+1;i<rows.length;i++){
+    const row=rows[i]||[];
+    const o=String(row[14]||'').trim()||'0';
+    const p=String(row[15]||'').trim()||dayKey();
+    const q=String(row[16]||'').trim()||'0';
+    const rr=String(row[17]||'').trim()||dayKey();
+    await update(AI_QUOTA_SHEET,`O${i+1}:R${i+1}`,[[o,p,q,rr]]);
   }
 }
 
@@ -218,6 +235,187 @@ function confirmBind(d){return `請確認要綁定的資料：\n\n${bindingSumma
 function graceActive(d){return Number.isFinite(parseLocal(d?.graceUntil))&&Date.now()<parseLocal(d.graceUntil);}
 
 
+
+function imageSetting(settings,key,envKey,fallback){
+  const sheet=String(settings?.[key]??'').trim();
+  if(sheet)return sheet;
+  const env=String(process.env[envKey]??'').trim();
+  return env||String(fallback);
+}
+function imageNumberSetting(settings,key,envKey,fallback,min=0,max=Infinity){
+  const candidates=[settings?.[key],process.env[envKey]];
+  for(const v of candidates){const n=Number(String(v??'').trim());if(Number.isFinite(n)&&n>=min&&n<=max)return n;}
+  return fallback;
+}
+function imageGenFlow(uid){const x=ai.imageGenFlows.get(uid);if(!x)return null;if(Date.now()-x.at>10*60*1000){ai.imageGenFlows.delete(uid);return null;}return x;}
+function setImageGenFlow(uid,data){ai.imageGenFlows.set(uid,{...data,at:Date.now()});}
+function clearImageGenFlow(uid){ai.imageGenFlows.delete(uid);}
+function imageTypeChoices(){return [
+  {label:'宣傳圖片',data:'action=image_type|v=宣傳圖片',displayText:'宣傳圖片'},
+  {label:'活動海報',data:'action=image_type|v=活動海報',displayText:'活動海報'},
+  {label:'教材插圖',data:'action=image_type|v=教材插圖',displayText:'教材插圖'},
+  {label:'社群貼文',data:'action=image_type|v=社群貼文',displayText:'社群貼文'},
+  {label:'其他',data:'action=image_type|v=其他',displayText:'其他'},
+  {label:'取消',data:'action=image_cancel',displayText:'取消'}
+];}
+function imageStyleChoices(){return [
+  {label:'專業清楚',data:'action=image_style|v=專業清楚',displayText:'專業清楚'},
+  {label:'可愛活潑',data:'action=image_style|v=可愛活潑',displayText:'可愛活潑'},
+  {label:'卡通插畫',data:'action=image_style|v=卡通插畫',displayText:'卡通插畫'},
+  {label:'寫實風格',data:'action=image_style|v=寫實風格',displayText:'寫實風格'},
+  {label:'簡約現代',data:'action=image_style|v=簡約現代',displayText:'簡約現代'},
+  {label:'取消',data:'action=image_cancel',displayText:'取消'}
+];}
+function imageCompositionChoices(){return [
+  {label:'正方形構圖',data:'action=image_comp|v=正方形構圖',displayText:'正方形構圖'},
+  {label:'偏直式構圖',data:'action=image_comp|v=偏直式構圖',displayText:'偏直式構圖'},
+  {label:'偏橫式構圖',data:'action=image_comp|v=偏橫式構圖',displayText:'偏橫式構圖'},
+  {label:'取消',data:'action=image_cancel',displayText:'取消'}
+];}
+function imageConfirmChoices(){return [
+  {label:'確認製作',data:'action=image_confirm',displayText:'確認製作'},
+  {label:'修改內容',data:'action=image_edit',displayText:'修改內容'},
+  {label:'取消',data:'action=image_cancel',displayText:'取消'}
+];}
+function imageFlowSummary(f){return `圖片類型：${f.type||'未選擇'}\n風格：${f.style||'未選擇'}\n構圖：${f.composition||'未選擇'}\n內容：${formatForLine(f.content||'')}`;}
+function buildImagePrompt(f){
+  const type=f.type||'一般圖片',style=f.style||'自然清楚',composition=f.composition||'正方形構圖',content=String(f.content||'').trim().slice(0,1200);
+  return `Create a ${type} for a LINE user. Style: ${style}. Composition: ${composition}. Main content: ${content}. Generate a clean, readable image. Avoid watermarks, UI screenshots, and unnecessary text. If text must appear in the image, keep it short and legible.`.slice(0,2000);
+}
+function imageGenConfigured(){return !!(process.env.CLOUDFLARE_ACCOUNT_ID&&process.env.CLOUDFLARE_API_TOKEN&&GENERATED_IMAGE_PUBLIC_BASE);}
+async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GEN_MAX_WAIT_MS){
+  if(!process.env.CLOUDFLARE_ACCOUNT_ID||!process.env.CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
+  if(!GENERATED_IMAGE_PUBLIC_BASE)throw new Error('IMAGE_PUBLIC_BASE_NOT_CONFIGURED');
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    const encodedModel=String(model).split('/').map(x=>encodeURIComponent(x)).join('/');
+    const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`;
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${process.env.CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
+    const raw=await r.text();
+    if(!r.ok){const e=new Error(`Cloudflare image ${r.status}: ${raw.slice(0,300)}`);e.code=r.status;throw e;}
+    let data;try{data=JSON.parse(raw);}catch{throw new Error('Cloudflare image invalid JSON');}
+    const b64=data?.result?.image||data?.result?.output_image||data?.image||'';
+    if(!b64||typeof b64!=='string')throw new Error('Cloudflare image response missing image');
+    return Buffer.from(b64,'base64');
+  }catch(e){if(e?.name==='AbortError'){const err=new Error('IMAGE_GENERATION_TIMEOUT');err.code=408;throw err;}throw e;}finally{clearTimeout(timer);}
+}
+const imageGenSemaphore={active:0,queue:[]};
+async function withImageGenSlot(limit,fn){
+  limit=Math.max(1,Number(limit||1));
+  if(imageGenSemaphore.active>=limit)await new Promise(resolve=>imageGenSemaphore.queue.push(resolve));
+  imageGenSemaphore.active++;
+  try{return await fn();}finally{imageGenSemaphore.active--;const next=imageGenSemaphore.queue.shift();if(next)next();}
+}
+async function reserveImageGenerationQuota(s,uid,lineName,role,settings){
+  return withAIQuotaLock(async()=>{
+    await ensureAIQuotaMediaColumns();
+    const fresh=await readSnapshot(true);const user=await ensureAIQuotaRow(fresh,uid,lineName,role,settings);const global=await ensureGlobalAIQuota(fresh,settings);
+    const m=quotaMeta(fresh);if(!m||m.imageGenCount<0||m.imageGenDate<0)throw new Error('IMAGE_QUOTA_SCHEMA');
+    const today=dayKey(),u=user.r,g=global.r;
+    let changedU=false,changedG=false;
+    if(String(u[m.imageGenDate]||'')!==today){u[m.imageGenCount]='0';u[m.imageGenDate]=today;changedU=true;}
+    if(String(g[m.imageGenDate]||'')!==today){g[m.imageGenCount]='0';g[m.imageGenDate]=today;changedG=true;}
+    const userLimit=imageNumberSetting(settings,'圖片每人每日免費張數','IMAGE_GEN_DAILY_USER_LIMIT',DEFAULT_IMAGE_GEN_DAILY_USER_LIMIT,1,100);
+    const globalLimit=imageNumberSetting(settings,'圖片每日免費總張數','IMAGE_GEN_DAILY_GLOBAL_LIMIT',DEFAULT_IMAGE_GEN_DAILY_GLOBAL_LIMIT,1,10000);
+    const userCount=quotaNumber(u[m.imageGenCount],0),globalCount=quotaNumber(g[m.imageGenCount],0);
+    if(userCount+1>userLimit)throw new Error('IMAGE_USER_LIMIT');
+    if(globalCount+1>globalLimit)throw new Error('IMAGE_GLOBAL_LIMIT');
+    u[m.imageGenCount]=String(userCount+1);g[m.imageGenCount]=String(globalCount+1);
+    if(changedU||true)await update(AI_QUOTA_SHEET,`Q${user.row}:R${user.row}`,[[u[m.imageGenCount],u[m.imageGenDate]]]);
+    if(changedG||true)await update(AI_QUOTA_SHEET,`Q${global.row}:R${global.row}`,[[g[m.imageGenCount],g[m.imageGenDate]]]);
+    fresh.aiQuotas[user.row-1]=u;fresh.aiQuotas[global.row-1]=g;cache.snapshot=fresh;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
+    ai.imageGenCountUsers.set(uid,userCount+1);ai.imageGenCountGlobal=globalCount+1;
+    return {userLimit,globalLimit};
+  });
+}
+async function releaseImageGenerationQuota(uid){
+  return withAIQuotaLock(async()=>{
+    const fresh=await readSnapshot(true);const user=findAIQuota(fresh,uid),global=findAIQuota(fresh,'__GLOBAL__');if(!user||!global)return;
+    const m=user.meta,gm=global.meta;const uc=Math.max(0,quotaNumber(user.r[m.imageGenCount],0)-1),gc=Math.max(0,quotaNumber(global.r[gm.imageGenCount],0)-1);
+    user.r[m.imageGenCount]=String(uc);global.r[gm.imageGenCount]=String(gc);
+    await update(AI_QUOTA_SHEET,`Q${user.row}:R${user.row}`,[[user.r[m.imageGenCount],user.r[m.imageGenDate]]]);
+    await update(AI_QUOTA_SHEET,`Q${global.row}:R${global.row}`,[[global.r[gm.imageGenCount],global.r[gm.imageGenDate]]]);
+    fresh.aiQuotas[user.row-1]=user.r;fresh.aiQuotas[global.row-1]=global.r;cache.snapshot=fresh;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
+    ai.imageGenCountUsers.set(uid,uc);ai.imageGenCountGlobal=gc;
+  });
+}
+async function storeGeneratedImage(buffer){
+  await fs.promises.mkdir(GENERATED_IMAGE_DIR,{recursive:true});
+  const token=crypto.randomBytes(24).toString('hex');
+  const originalPath=path.join(GENERATED_IMAGE_DIR,`${token}.jpg`),previewPath=path.join(GENERATED_IMAGE_DIR,`${token}.preview.jpg`);
+  const original=await sharp(buffer).jpeg({quality:88,mozjpeg:true}).toBuffer();
+  if(original.length>10*1024*1024)throw new Error('GENERATED_IMAGE_TOO_LARGE');
+  const preview=await sharp(buffer).resize({width:320,height:320,fit:'inside',withoutEnlargement:true}).jpeg({quality:62,mozjpeg:true}).toBuffer();
+  if(preview.length>1024*1024)throw new Error('GENERATED_PREVIEW_TOO_LARGE');
+  await fs.promises.writeFile(originalPath,original);await fs.promises.writeFile(previewPath,preview);
+  const timer=setTimeout(async()=>{for(const f of [originalPath,previewPath]){try{await fs.promises.unlink(f);}catch{}}},DEFAULT_GENERATED_IMAGE_TTL_MS);if(timer.unref)timer.unref();
+  return {originalUrl:`${GENERATED_IMAGE_PUBLIC_BASE}/generated-image/${token}`,previewUrl:`${GENERATED_IMAGE_PUBLIC_BASE}/generated-image/${token}?preview=1`};
+}
+async function performImageGeneration(event,s,uid,lineName,settings,flow,startedAt){
+  if(!imageGenConfigured())throw new Error(process.env.CLOUDFLARE_ACCOUNT_ID&&process.env.CLOUDFLARE_API_TOKEN?'IMAGE_PUBLIC_BASE_NOT_CONFIGURED':'IMAGE_PROVIDER_NOT_CONFIGURED');
+  const model=imageSetting(settings,'圖片生成模型','CLOUDFLARE_IMAGE_MODEL',IMAGE_GEN_DEFAULT_MODEL);
+  const steps=imageNumberSetting(settings,'圖片生成步數','CLOUDFLARE_IMAGE_STEPS',DEFAULT_IMAGE_GEN_STEPS,1,8);
+  const waitMs=imageNumberSetting(settings,'圖片生成最長等待秒數','CLOUDFLARE_IMAGE_TIMEOUT_MS',DEFAULT_IMAGE_GEN_MAX_WAIT_MS,15000,180000);
+  const concurrency=imageNumberSetting(settings,'圖片生成同時處理數','IMAGE_GEN_CONCURRENCY',DEFAULT_IMAGE_GEN_CONCURRENCY,1,4);
+  await reserveImageGenerationQuota(s,uid,lineName,contactByUid(s,uid)?.role||'未完成綁定',settings);
+  let generationSucceeded=false;
+  try{
+    const prompt=buildImagePrompt(flow);
+    const started=Date.now();
+    const buf=await withImageGenSlot(concurrency,()=>callCloudflareImage(prompt,model,steps,waitMs));
+    generationSucceeded=true;
+    const stored=await storeGeneratedImage(buf);
+    const messages=[{type:'image',originalContentUrl:stored.originalUrl,previewImageUrl:stored.previewUrl}];
+    await replyOrPushMessages(event,uid,messages,startedAt);
+    console.log('IMAGE success',{provider:'cloudflare-workers-ai',model,steps,uid,elapsedMs:Date.now()-started});
+  }catch(e){if(!generationSucceeded)await releaseImageGenerationQuota(uid);throw e;}
+}
+function imageModePrompt(){return '請先選擇圖片類型：';}
+async function startImageGeneration(event,s,uid,sm){
+  setImageGenFlow(uid,{step:'type',type:'',style:'',composition:'',content:''});
+  await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
+  if(event.replyToken)await lineReplyQuick(event.replyToken,`${imageModePrompt()}\n\n此功能使用免費圖片製作通道；送出前會再次讓您確認。`,imageTypeChoices());
+}
+async function handleImageGenPostback(event,s,uid,lineName,sm){
+  const data=String(event.postback?.data||'');
+  if(data==='action=image_cancel'){clearImageGenFlow(uid);if(event.replyToken)await lineReply(event.replyToken,'已取消圖片製作。');return true;}
+  const m=data.match(/^action=image_(type|style|comp)\|v=(.*)$/);if(!m&&!/^action=image_(confirm|edit)$/.test(data))return false;
+  const flow=imageGenFlow(uid);if(!flow){if(event.replyToken)await lineReply(event.replyToken,'這次圖片製作要求已逾時，請重新從選單選擇「⑥ 圖片製作」。');return true;}
+  const key={type:'type',style:'style',comp:'composition'}[m?.[1]||''];
+  if(key){flow[key]=m[2];flow.at=Date.now();flow.step=key==='type'?'style':key==='style'?'composition':'content';setImageGenFlow(uid,flow);
+    if(key==='type'&&event.replyToken)await lineReplyQuick(event.replyToken,'請選擇圖片風格：',imageStyleChoices());
+    else if(key==='style'&&event.replyToken)await lineReplyQuick(event.replyToken,'請選擇構圖方向（圖片實際輸出維持免費模型支援的尺寸）：',imageCompositionChoices());
+    else if(key==='composition'&&event.replyToken)await lineReply(event.replyToken,'請輸入圖片內容，例如：「暑期數學營招生海報，標題清楚，適合家長閱讀」。內容最多 300 字。');
+    return true;
+  }
+  if(data==='action=image_edit'){flow.step='content';flow.content='';flow.at=Date.now();setImageGenFlow(uid,flow);if(event.replyToken)await lineReply(event.replyToken,'請重新輸入這次圖片要呈現的內容。');return true;}
+  if(data==='action=image_confirm'){
+    const startedAt=Date.now();clearImageGenFlow(uid);
+    try{await withLineLoading(uid,60,()=>performImageGeneration(event,s,uid,lineName,sm,flow,startedAt));}
+    catch(e){console.error('image generation',e.message);const msg=e.message==='IMAGE_USER_LIMIT'?'您今天的免費圖片製作次數已達上限，請明天再試。':e.message==='IMAGE_GLOBAL_LIMIT'?'今天的免費圖片製作資源已達系統上限，請明天再試。':e.message==='IMAGE_PROVIDER_NOT_CONFIGURED'?'目前免費圖片製作通道尚未完成設定，請聯絡管理員。':e.message==='IMAGE_PUBLIC_BASE_NOT_CONFIGURED'?'圖片服務的回傳網址尚未設定，請聯絡管理員。':e.message==='IMAGE_GENERATION_TIMEOUT'?'圖片製作時間較長，這次沒有完成，請稍後再試。':'目前無法完成圖片製作，請稍後再試。';try{await replyOrPush(event,uid,msg,startedAt);}catch{} }
+    return true;
+  }
+  return false;
+}
+async function handleImageGenText(event,s,uid,lineName,sm,text){
+  const flow=imageGenFlow(uid);if(!flow)return false;
+  if(text==='取消'||text==='取消製作'){clearImageGenFlow(uid);if(event.replyToken)await lineReply(event.replyToken,'已取消圖片製作。');return true;}
+  if(flow.step==='type'){flow.type=text;flow.step='style';setImageGenFlow(uid,flow);if(event.replyToken)await lineReplyQuick(event.replyToken,'請選擇圖片風格：',imageStyleChoices());return true;}
+  if(flow.step==='style'){flow.style=text;flow.step='composition';setImageGenFlow(uid,flow);if(event.replyToken)await lineReplyQuick(event.replyToken,'請選擇構圖方向（圖片實際輸出維持免費模型支援的尺寸）：',imageCompositionChoices());return true;}
+  if(flow.step==='composition'){flow.composition=text;flow.step='content';setImageGenFlow(uid,flow);if(event.replyToken)await lineReply(event.replyToken,'請輸入圖片內容，例如：「暑期數學營招生海報，標題清楚，適合家長閱讀」。內容最多 300 字。');return true;}
+  if(flow.step==='content'){
+    if(text.length>300){if(event.replyToken)await lineReply(event.replyToken,'圖片內容最多 300 字，請縮短後再送出。');return true;}
+    flow.content=text;flow.step='confirm';setImageGenFlow(uid,flow);
+    if(event.replyToken)await lineReplyQuick(event.replyToken,`圖片製作確認：\n\n${imageFlowSummary(flow)}\n\n請確認是否開始製作。`,imageConfirmChoices());return true;
+  }
+  if(flow.step==='confirm'){
+    const words=['確認製作','確認','開始製作','製作'];
+    if(words.includes(text)){const fake={type:'postback',postback:{data:'action=image_confirm'},replyToken:event.replyToken,source:event.source};return await handleImageGenPostback(fake,s,uid,lineName,sm);}
+    if(['修改內容','修改','重新輸入'].includes(text)){flow.step='content';flow.content='';setImageGenFlow(uid,flow);if(event.replyToken)await lineReply(event.replyToken,'請重新輸入圖片內容。');return true;}
+    if(event.replyToken)await lineReplyQuick(event.replyToken,`目前已整理完成：\n\n${imageFlowSummary(flow)}\n\n請選擇「確認製作」或「修改內容」。`,imageConfirmChoices());return true;
+  }
+  return false;
+}
 function taipeiDateParts(){
   const now=new Date();
   const weekday=new Intl.DateTimeFormat('zh-TW',{timeZone:TZ,weekday:'long'}).format(now).replace('星期','');
@@ -262,7 +460,7 @@ function formatCourseRows(rows){return rows.map((x,i)=>{const head=rows.length>1
 function courseQueryAsksUnsupportedInfo(text){return /(學習狀況|學習情況|成績|測驗|考試結果|表現|進度|出勤|缺課|評語|能力|排名)/.test(String(text||''));}
 function resetInMemoryQuota(q){
   const d=dayKey();
-  if(q.day!==d){q.day=d;q.total=0;q.users.clear();q.lastUse.clear();q.mediaBytesGlobal=0;q.mediaBytesUsers.clear();q.pendingMediaText.clear();q.pendingMedia.clear();}
+  if(q.day!==d){q.day=d;q.total=0;q.users.clear();q.lastUse.clear();q.mediaBytesGlobal=0;q.mediaBytesUsers.clear();q.pendingMediaText.clear();q.pendingMedia.clear();q.imageGenFlows.clear();q.imageGenCountGlobal=0;q.imageGenCountUsers.clear();}
 }
 async function withMediaSlot(fn){
   const limit=Math.max(1,Number(process.env.MEDIA_CONCURRENCY||DEFAULT_MEDIA_CONCURRENCY));
@@ -294,7 +492,7 @@ function quotaMeta(s){
   const rows=s.aiQuotas||[],h=s.aiQuotasHeaderRow;
   if(h<0)return null;
   const header=(rows[h]||[]).map(x=>String(x).trim()),idx=n=>header.indexOf(n);
-  return {row:h,uid:idx('LINE User ID'),name:idx('LINE 顯示名稱／姓名'),role:idx('身分'),base:idx('每日基本額度'),extra:idx('額外次數'),used:idx('今日已用'),remain:idx('剩餘次數'),date:idx('額度日期'),op:idx('額度操作'),opStatus:idx('操作狀態'),last:idx('最後使用時間'),note:idx('備註'),mediaBytes:MEDIA_RESOURCE_SHEET_COLUMNS.bytes,mediaDate:MEDIA_RESOURCE_SHEET_COLUMNS.date};
+  return {row:h,uid:idx('LINE User ID'),name:idx('LINE 顯示名稱／姓名'),role:idx('身分'),base:idx('每日基本額度'),extra:idx('額外次數'),used:idx('今日已用'),remain:idx('剩餘次數'),date:idx('額度日期'),op:idx('額度操作'),opStatus:idx('操作狀態'),last:idx('最後使用時間'),note:idx('備註'),mediaBytes:MEDIA_RESOURCE_SHEET_COLUMNS.bytes,mediaDate:MEDIA_RESOURCE_SHEET_COLUMNS.date,imageGenCount:idx('今日生圖次數'),imageGenDate:idx('生圖額度日期')};
 }
 function findAIQuota(s,uid){const m=quotaMeta(s);if(!m)return null;for(let i=m.row+1;i<(s.aiQuotas||[]).length;i++){const r=s.aiQuotas[i]||[];if(norm(r[m.uid])===norm(uid))return {row:i+1,r,meta:m};}return null;}
 function quotaNumber(v,def=0){const n=Number(String(v??'').trim());return Number.isFinite(n)?n:def;}
@@ -813,6 +1011,7 @@ async function lineReplyPayload(token,messages){
 async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
 async function lineReplyQuick(token,text,items){await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
 async function linePush(uid,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
+async function linePushMessages(uid,messages){const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
 async function lineLoading(uid,seconds=60){const r=await fetch('https://api.line.me/v2/bot/chat/loading/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({chatId:uid,loadingSeconds:Math.min(60,Math.max(5,Math.round(seconds/5)*5))})});if(!r.ok)throw new Error(`LINE loading ${r.status}: ${await r.text()}`);}
 async function withLineLoading(uid,waitMs,fn){
   let stopped=false;
@@ -826,6 +1025,12 @@ async function replyOrPush(event,uid,text,startedAt){
     try{await lineReply(event.replyToken,text);return;}catch(e){console.warn('LINE reply failed, fallback to push',e.message);}
   }
   await linePush(uid,text);
+}
+async function replyOrPushMessages(event,uid,messages,startedAt){
+  if(event?.replyToken&&Date.now()-startedAt<AI_REPLY_SAFE_WINDOW_MS){
+    try{await lineReplyPayload(event.replyToken,messages);return;}catch(e){console.warn('LINE reply messages failed, fallback to push',e.message);}
+  }
+  await linePushMessages(uid,messages);
 }
 
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
@@ -883,6 +1088,15 @@ async function processPendingMediaConfirmed(event,s,uid,lineName,settings,pendin
   });
 }
 
+app.get('/generated-image/:token',async(req,res)=>{
+  const token=String(req.params.token||'');
+  if(!/^[a-f0-9]{48}$/.test(token))return res.status(404).end();
+  const isPreview=String(req.query.preview||'')==='1';
+  const file=path.join(GENERATED_IMAGE_DIR,isPreview?`${token}.preview.jpg`:`${token}.jpg`);
+  try{await fs.promises.access(file,fs.constants.R_OK);}catch{return res.status(404).end();}
+  res.setHeader('Content-Type','image/jpeg');res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.sendFile(file);
+});
+
 app.get('/health',(_req,res)=>res.json({ok:true}));
 
 app.post('/webhook',async(req,res)=>{
@@ -892,7 +1106,7 @@ app.post('/webhook',async(req,res)=>{
       const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
       if(event.type==='follow'){await saveInteraction(s,uid,'安靜模式','');queueLog([nowTaipei(),uid,lineName,'follow','','',event.replyToken||'','安靜模式']);const sm=settingsMap(s);if(event.replyToken&&sm['加入好友歡迎訊息']!=='否'){const welcome=sm['加入好友歡迎訊息']||`您好，歡迎加入！\n\n如需服務，請輸入「${sm['喚醒關鍵詞']||'選單'}」。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;await lineReply(event.replyToken,welcome);}return;}
       const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
-      if(event.type==='postback'){await handleMediaPostback(event,s,uid,lineName,sm);return;}
+      if(event.type==='postback'){if(await handleImageGenPostback(event,s,uid,lineName,sm))return;if(await handleMediaPostback(event,s,uid,lineName,sm))return;}
       if(event.type!=='message')return;
       const messageType=String(event.message?.type||'');
       const text=messageType==='text'?String(event.message.text||'').trim():'';
@@ -902,7 +1116,7 @@ app.post('/webhook',async(req,res)=>{
         if(messageType==='image'||messageType==='file'){await handleMediaMessage(event,s,uid,lineName,sm);}
         return;
       }
-      if(text===kw||text==='功能選單'){await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,`您好，請選擇您要使用的功能：\n\n① LINE綁定\n② 課程查詢\n③ 繳費／收據\n④ AI客服\n⑤ 人工客服\n\n輸入「取消」可離開互動模式。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`);return;}
+      if(text===kw||text==='功能選單'){await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,`您好，請選擇您要使用的功能：\n\n① LINE綁定\n② 課程查詢\n③ 繳費／收據\n④ AI客服\n⑤ 人工客服\n⑥ 圖片製作\n\n輸入「取消」可離開互動模式。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`);return;}
       if(text==='取消'||text==='取消互動'){clearHistory(uid);await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。\n\n如需服務，請輸入「選單」。');return;}
       if(looksLikeInternalInfoProbe(text)){if(event.replyToken)await lineReply(event.replyToken,INTERNAL_INFO_REPLY);return;}
 
@@ -950,6 +1164,14 @@ app.post('/webhook',async(req,res)=>{
         if(status==='WAIT_ADMIN_REBIND_CONFIRM'){
           if(text==='取消'){await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal'});if(event.replyToken)await lineReply(event.replyToken,'已取消申請，原綁定維持不變。');return;}if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「取消」。');return;}const d=b.data||{},old=bindingSummary(d),requested=d.role==='老師'?String(d.pendingTeacherName||''):uniq(d.pendingStudentNames||[]).join('、');await appendReview(s,uid,lineName,d.role,old,requested);const c=contactByUid(s,uid),m=contactMeta(s);if(c&&m?.perm>=0){const row=[...(s.contacts[c.row-1]||[])];row[m.perm]='否';await update(CONTACT_SHEET,`A${c.row}:${col(Math.max(10,row.length))}${c.row}`,[row]);s.contacts[c.row-1]=row;}await saveBinding(s,uid,'BOUND',{...d,pendingAdminRebind:true});if(event.replyToken)await lineReply(event.replyToken,'重新綁定申請已送出。為保護資料，課表查詢權限已暫停；請等待管理員確認。');return;
         }
+      }
+
+      if(text==='⑥ 圖片製作'||text==='6' || text==='圖片製作'){
+        await startImageGeneration(event,s,uid,sm);return;
+      }
+
+      if(awake(s,uid)&&interaction?.mode==='AI圖片製作模式'){
+        if(await handleImageGenText(event,s,uid,lineName,sm,text))return;
       }
 
       if(awake(s,uid)&&interaction?.mode==='AI課程查詢模式'){
@@ -1033,6 +1255,6 @@ app.post('/webhook',async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v2.7 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.8 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

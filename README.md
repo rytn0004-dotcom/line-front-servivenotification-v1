@@ -1,29 +1,51 @@
-# LINE 客服系統 V2.7｜確認送出＋長等待＋LINE 載入動畫＋即時資訊
+# LINE 客服系統 V2.8｜免費圖片製作＋選擇式確認
 
-本版延續 V2.6 Gemini A/B/C 多 Project Router，重點是降低誤切換、改善 LINE 使用體驗與提高答案完整性。
+本版以 V2.7.1 為基礎，新增「⑥ 圖片製作」，圖片生成不使用 Gemini 生圖模型，也不啟用任何付費 Gemini 圖片 API。
 
-## V2.7 行為
-- 不再以 10 秒未回覆就切模型。一般問題預設最長等待 90 秒、圖片 120 秒、PDF 150 秒；單一 Gemini 模型本身預設最多等待 60 秒。
-- 503／429／5xx 等明確錯誤會立即進行 fallback；單純「仍在生成」不因短暫沉默而切換。
-- 使用 LINE 原生 loading animation，處理期間在一對一聊天顯示載入動畫；長於 50 秒會自動刷新載入動畫。LINE 官方支援 5～60 秒的 loading animation，且在官方帳號送出訊息時會自動消失。
-- 若 AI 最終處理時間超過安全回覆窗口，程式改用 push message 回傳，避免 reply token 過期。LINE 官方規定 reply token 僅能使用一次，並建議盡快使用。
-- 圖片／PDF 收到文字要求後先顯示「確認送出／修改要求／取消」快速回覆，不再由 AI 判斷是否還需要追問。
-- 涉及「2026、目前、最近、最新」等即時性問題時，可啟用 Google Search grounding；今天／星期／現在時間仍由後端直接回答。
-- API、模型、Project、Provider、Prompt 等內部資訊仍對外隱藏。
-- 私人課表仍先做 LINE User ID＋課表查詢權限＋授權對象過濾。
+## 主要功能
+- LINE 選單新增「⑥ 圖片製作」。
+- 圖片製作流程採選擇式引導：圖片類型 → 風格 → 構圖 → 內容 → 確認製作。
+- 只有按「確認製作」才真正呼叫圖片生成 API；修改與取消不生成、不扣生圖張數。
+- 目前圖片生成模型：`@cf/black-forest-labs/flux-1-schnell`（Cloudflare Workers AI）。
+- 圖片生成預設 4 steps；可由 Render `CLOUDFLARE_IMAGE_STEPS` 或 Google Sheet「系統設定／圖片生成步數」調整，範圍 1～8。
+- 內建每日每人、每日全站免費生圖張數限制，以及同時處理上限。
+- 生成失敗（API 未成功產圖）會退回生圖張數；已成功產圖後則不退回，以免重複消耗免費資源。
+- 生成圖片會暫存在 Render `/tmp`，提供 LINE 讀取約 15 分鐘後自動刪除。
+- LINE 使用 `originalContentUrl` + `previewImageUrl` 傳回圖片；原圖與預覽均使用 HTTPS。
+- 不對外揭露 Gemini、Cloudflare、Project、Provider、API、Prompt 等內部資訊。
 
-## Render Environment Variables
-至少：
-- `GEMINI_API_KEY`
+## Cloudflare 免費資源
+Cloudflare Workers AI 目前在 Free plan 提供每日 10,000 Neurons 的免費配置；FLUX.1 Schnell 的官方模型 ID 為 `@cf/black-forest-labs/flux-1-schnell`。官方文件列出的預設步數為 4、最大 8，生成回應包含 Base64 圖片，可直接轉成圖片檔。請注意 10,000 Neurons 是 Cloudflare Workers AI 的每日免費配置總量，不只本程式；其他同帳號 Workers AI 用量也會佔用該配置。
 
-可選備援：
-- `GEMINI_API_KEY_B`
-- `GEMINI_API_KEY_C`
+## Render 必填設定
+在 Render → Service → Environment 加：
 
-建議：
-- `GEMINI_MODEL_ORDER=gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.1-flash-lite`
-- `GEMINI_REQUEST_TIMEOUT_MS=60000`
-- `GEMINI_MODEL_COOLDOWN_MS=30000`
-- `AI_ENABLE_GOOGLE_SEARCH=true`
+1. `CLOUDFLARE_ACCOUNT_ID`：Cloudflare 的 Account ID。
+2. `CLOUDFLARE_API_TOKEN`：Workers AI API Token。
+3. `PUBLIC_BASE_URL`：這個 Render Service 的 HTTPS 公開網址，例如 `https://xxx.onrender.com`。
+4. 原本的 LINE／Google Sheet／Gemini 環境變數照舊。
 
-Excel 與程式分開提供；API Key 不放 Excel。
+圖片模型設定可用：
+- Render：`CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-1-schnell`
+- Google Sheet：`系統設定` 的 `圖片生成模型`
+
+若兩者都有設定，以 Google Sheet `系統設定` 的值優先；Render 環境變數是無設定該列時的備援。
+
+## Cloudflare Token 建立
+Cloudflare Dashboard → Workers AI → Use REST API → Create a Workers AI API Token，並取得 Account ID。Token 權限至少需要 Account → Workers AI → Read。
+
+## 目前免費生圖資源保護預設
+- 每人每日免費圖片：2 張
+- 全站每日免費圖片：20 張
+- 圖片生成步數：4
+- 同時處理：1 張
+- 單次最長等待：90 秒
+
+以上可在 Google Sheet「系統設定」調整，不需要改 server.js。
+
+## Excel 規格
+AI 額度管理的既有 G 欄剩餘次數公式維持不變；V2.8 另使用 Q/R 欄記錄「今日生圖次數／生圖額度日期」，不覆蓋 G/H 公式。
+
+## 注意
+- 本版沒有接 Gemini `gemini-3.1-flash-image`，因目前 Gemini API Free Tier 不提供該圖片模型的免費使用。
+- Cloudflare Workers AI 的免費配置不是永久保證；請以 Cloudflare 當下 Dashboard／官方定價為準。

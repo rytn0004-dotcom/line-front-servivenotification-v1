@@ -1,6 +1,26 @@
-V2.7 部署重點
-1. Render Environment Variables 保留 GEMINI_API_KEY；若有獨立 Project 備援，可填 GEMINI_API_KEY_B、GEMINI_API_KEY_C。
-2. 建議 GEMINI_REQUEST_TIMEOUT_MS=60000。系統設定中的一般／圖片／PDF 最長等待時間分別預設 90／120／150 秒。
-3. AI 處理期間使用 LINE 原生 loading animation；處理超過 50 秒時會自動刷新。
-4. 媒體收到文字要求後先顯示「確認送出／修改要求／取消」，按確認後才呼叫 AI。
-5. 本 ZIP 不含 Excel；正式 Excel 另行提供。
+V2.8 圖片製作部署重點
+
+Render Environment:
+CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-1-schnell
+CLOUDFLARE_IMAGE_STEPS=4
+PUBLIC_BASE_URL=https://你的Render服務網址.onrender.com
+
+不要把 API Token 寫入 Excel、GitHub 或前端。
+不要把 GEMINI API Key 寫入 Excel、GitHub 或前端。
+
+Google Sheet「系統設定」會新增／使用：
+圖片製作功能
+圖片生成模型
+圖片生成步數
+圖片每人每日免費張數
+圖片每日免費總張數
+圖片生成最長等待秒數
+圖片生成同時處理數
+圖片暫存分鐘數
+
+AI額度管理 Q/R：
+Q 今日生圖次數
+R 生圖額度日期
+G/H 原有公式不覆蓋。
