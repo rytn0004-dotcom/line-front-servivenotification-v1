@@ -767,7 +767,7 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
       return;
     }
     setPendingMedia(uid,{messageId:id,type:'image',fileName:'',fileSize:Number(event.message?.fileSize||0),instruction,awaitingConfirm:true});
-    if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到圖片與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。若按鈕沒有顯示，也可以直接輸入「確認送出」或「發送」。`,mediaConfirmQuickReply());
+    if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到圖片與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。`,mediaConfirmQuickReply());
     return;
   }
   if(type==='file'){
@@ -791,7 +791,7 @@ async function handleMediaMessage(event,s,uid,lineName,settings){
       return;
     }
     setPendingMedia(uid,{messageId:id,type:'file',fileName,fileSize:declaredSize,instruction,awaitingConfirm:true});
-    if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到 PDF 與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。若按鈕沒有顯示，也可以直接輸入「確認送出」或「發送」。`,mediaConfirmQuickReply());
+    if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到 PDF 與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。`,mediaConfirmQuickReply());
     return;
   }
   if(event.replyToken)await lineReply(event.replyToken,'目前只支援圖片與 PDF 文件問答。');
@@ -803,7 +803,7 @@ async function handleDeferredMediaWithText(event,s,uid,lineName,settings,pending
   if(!String(instruction||'').trim()){if(event.replyToken)await lineReply(event.replyToken,'請告訴我希望如何處理這份圖片／文件。');return;}
   setPendingMedia(uid,{...pending,instruction:String(instruction).trim(),editing:false,awaitingConfirm:true});
   const label=type==='image'?'圖片':'PDF';
-  if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到${label}與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。若按鈕沒有顯示，也可以直接輸入「確認送出」或「發送」。`,mediaConfirmQuickReply());
+  if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到${label}與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。`,mediaConfirmQuickReply());
 }
 
 async function lineReplyPayload(token,messages){
@@ -977,30 +977,6 @@ app.post('/webhook',async(req,res)=>{
           const c=contactByUid(s,uid);const aiSettings=settingsMap(s);
           const pending=takePendingMedia(uid);
           if(pending){
-            const confirmWords=['確認送出','確認','發送','送出','開始生成','開始處理','確定'];
-            const editWords=['修改要求','修改','重新輸入','改一下','更改'];
-            if(pending.awaitingConfirm){
-              if(text==='取消'){if(event.replyToken)await lineReply(event.replyToken,'已取消這次圖片／文件處理。');return;}
-              if(editWords.includes(text)){
-                setPendingMedia(uid,{...pending,editing:true,awaitingConfirm:false,instruction:''});
-                if(event.replyToken)await lineReply(event.replyToken,'請重新輸入這次圖片／文件的處理要求。輸入後會再次顯示確認按鈕。');
-                return;
-              }
-              if(confirmWords.includes(text)){
-                const startedAt=Date.now();
-                const kind=pending.type==='image'?'image':'document';
-                try{
-                  await processPendingMediaConfirmed(event,s,uid,lineName,aiSettings,pending,String(pending.instruction||'').trim(),startedAt);
-                }catch(e){
-                  console.error('media text confirm',e.message);
-                  const msg=e.message==='AI_MEDIA_LIMIT'?`今日${kind==='image'?'圖片':'文件'}使用量已達上限，請稍後再試。`:e.message==='MEDIA_TOO_LARGE'?`${kind==='image'?'圖片':'文件'}超過系統限制，請壓縮後再傳送。`:e.message==='AI_LIMIT'?`本日 AI 額度不足；${kind==='image'?'圖片需使用 2 次':'文件需使用 3 次'}額度。`:e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片／文件目前無法處理，請稍後再試。';
-                  try{await replyOrPush(event,uid,msg,startedAt);}catch(sendErr){console.error('media text confirm send failed',sendErr.message);}
-                }
-                return;
-              }
-              if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到圖片／文件與您的要求：\n\n「${formatForLine(pending.instruction||'')}」\n\n請選擇「確認送出」開始處理。若按鈕沒有顯示，也可以直接輸入「確認送出」或「發送」。`,mediaConfirmQuickReply());
-              return;
-            }
             if(text==='取消'){if(event.replyToken)await lineReply(event.replyToken,'已取消這次圖片／文件處理。');return;}
             await handleDeferredMediaWithText(event,s,uid,lineName,sm,pending,text);
             return;
