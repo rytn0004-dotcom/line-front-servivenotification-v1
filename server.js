@@ -20,8 +20,8 @@ const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
-const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||60000));
-const DEFAULT_AI_TEXT_WAIT_MS=60000;
+const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||120000));
+const DEFAULT_AI_TEXT_WAIT_MS=120000;
 const DEFAULT_AI_IMAGE_WAIT_MS=90000;
 const DEFAULT_AI_DOCUMENT_WAIT_MS=120000;
 const AI_REPLY_SAFE_WINDOW_MS=50000;
@@ -198,7 +198,7 @@ async function flushLogs(){if(!logBuffer.length)return;const rows=logBuffer.spli
 
 function settingsMap(s){const o={};const rows=s.settings||[],h=s.settingsHeaderRow;if(h<0)return o;for(let i=h+1;i<rows.length;i++){const r=rows[i]||[];if(r[0])o[String(r[0])]=String(r[1]||'');}return o;}
 function findBinding(s,uid){for(let i=0;i<(s.bindings||[]).length;i++){const r=s.bindings[i]||[];if(norm(r[0])!==norm(uid))continue;let d={};try{d=JSON.parse(r[2]||'{}');}catch{}return {row:i+1,status:String(r[1]||''),data:d};}return null;}
-function findInteraction(s,uid){for(let i=0;i<(s.interactions||[]).length;i++){const r=s.interactions[i]||[];if(norm(r[0])===norm(uid))return {row:i+1,mode:String(r[1]||''),expireAt:String(r[3]||'')};}return null;}
+function findInteraction(s,uid){let found=null;for(let i=0;i<(s.interactions||[]).length;i++){const r=s.interactions[i]||[];if(norm(r[0])===norm(uid))found={row:i+1,mode:String(r[1]||''),expireAt:String(r[3]||''),updatedAt:String(r[4]||'')};}return found;}
 function contactMeta(s){const rows=s.contacts||[],h=(rows[s.contactsHeaderRow]||[]).map(String).map(x=>x.trim());const idx=n=>h.indexOf(n);return {row:s.contactsHeaderRow,name:idx('姓名'),role:idx('身分'),student:idx('學生姓名/關聯（可多位）'),uid:idx('LINE User ID'),status:idx('綁定狀態'),time:idx('最後綁定時間'),active:idx('通知啟用'),note:idx('備註'),perm:idx('課表查詢權限')};}
 function contactByUid(s,uid){const m=contactMeta(s);if(m.row<0)return null;for(let i=m.row+1;i<(s.contacts||[]).length;i++){const r=s.contacts[i]||[];if(norm(r[m.uid])===norm(uid))return {row:i+1,role:String(r[m.role]||''),students:splitNames(r[m.student]||''),teacherName:String(String(r[m.role]||'')==='老師'?r[m.student]||'':'').trim(),permission:String(r[m.perm]||''),status:String(r[m.status]||'')};}return null;}
 async function upsertContact(s,uid,lineName,role,students,teacherName,note){
@@ -374,7 +374,8 @@ function imageModePrompt(){return '請先選擇圖片類型：';}
 async function startImageGeneration(event,s,uid,sm){
   setImageGenFlow(uid,{step:'type',type:'',style:'',composition:'',content:''});
   await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
-  if(event.replyToken)await lineReplyQuick(event.replyToken,`${imageModePrompt()}\n\n此功能使用免費圖片製作通道；送出前會再次讓您確認。`,imageTypeChoices());
+  const note=imageGenConfigured()?'此功能使用免費圖片製作通道；送出前會再次讓您確認。':'此功能尚未完成 Cloudflare 圖片通道設定；仍可先填寫內容，確認製作時會提示管理員處理。';
+  if(event.replyToken)await lineReplyQuick(event.replyToken,`${imageModePrompt()}\n\n${note}`,imageTypeChoices());
 }
 async function handleImageGenPostback(event,s,uid,lineName,sm){
   const data=String(event.postback?.data||'');
@@ -390,9 +391,23 @@ async function handleImageGenPostback(event,s,uid,lineName,sm){
   }
   if(data==='action=image_edit'){flow.step='content';flow.content='';flow.at=Date.now();setImageGenFlow(uid,flow);if(event.replyToken)await lineReply(event.replyToken,'請重新輸入這次圖片要呈現的內容。');return true;}
   if(data==='action=image_confirm'){
-    const startedAt=Date.now();clearImageGenFlow(uid);
-    try{await withLineLoading(uid,60,()=>performImageGeneration(event,s,uid,lineName,sm,flow,startedAt));}
-    catch(e){console.error('image generation',e.message);const msg=e.message==='IMAGE_USER_LIMIT'?'您今天的免費圖片製作次數已達上限，請明天再試。':e.message==='IMAGE_GLOBAL_LIMIT'?'今天的免費圖片製作資源已達系統上限，請明天再試。':e.message==='IMAGE_PROVIDER_NOT_CONFIGURED'?'目前免費圖片製作通道尚未完成設定，請聯絡管理員。':e.message==='IMAGE_PUBLIC_BASE_NOT_CONFIGURED'?'圖片服務的回傳網址尚未設定，請聯絡管理員。':e.message==='IMAGE_GENERATION_TIMEOUT'?'圖片製作時間較長，這次沒有完成，請稍後再試。':'目前無法完成圖片製作，請稍後再試。';try{await replyOrPush(event,uid,msg,startedAt);}catch{} }
+    const startedAt=Date.now();
+    try{
+      await withLineLoading(uid,60,()=>performImageGeneration(event,s,uid,lineName,sm,flow,startedAt));
+      clearImageGenFlow(uid);
+    }catch(e){
+      console.error('image generation',e.message);
+      const code=Number(e?.code||0);
+      const msg=e.message==='IMAGE_USER_LIMIT'?'您今天的免費圖片製作次數已達上限，請明天再試。':
+        e.message==='IMAGE_GLOBAL_LIMIT'?'今天的免費圖片製作資源已達系統上限，請稍後再次嘗試。':
+        e.message==='IMAGE_PROVIDER_NOT_CONFIGURED'?'目前免費圖片製作通道尚未完成設定，請聯絡管理員。':
+        e.message==='IMAGE_PUBLIC_BASE_NOT_CONFIGURED'?'圖片服務的回傳網址尚未設定，請聯絡管理員。':
+        e.message==='IMAGE_GENERATION_TIMEOUT'?'圖片製作等待時間較長，這次沒有完成。您可以稍後再次按「確認製作」。':
+        code===429?'圖片製作通道目前忙碌，請稍後再次按「確認製作」。':
+        code===401||code===403?'圖片製作通道驗證失敗，請聯絡管理員檢查 Cloudflare 設定。':
+        '目前無法完成圖片製作，您可以稍後再次按「確認製作」。';
+      try{await replyOrPush(event,uid,msg,startedAt);}catch{}
+    }
     return true;
   }
   return false;
@@ -779,7 +794,7 @@ function needsFreshWeb(text){
 function aiWaitMsFor(kind,settings){
   if(kind==='image')return Math.max(15000,aiSettingNum(settings,'AI 圖片最長等待秒數',90)*1000);
   if(kind==='document')return Math.max(15000,aiSettingNum(settings,'AI 文件最長等待秒數',120)*1000);
-  return Math.max(15000,aiSettingNum(settings,'AI 一般最長等待秒數',60)*1000);
+  return Math.max(15000,aiSettingNum(settings,'AI 一般最長等待秒數',aiSettingNum(settings,'AI 請求逾時秒數',120))*1000);
 }
 function outputTokensFor(kind,settings){
   if(kind==='image')return Math.max(200,aiSettingNum(settings,'AI 圖片回覆最大 Tokens',1000));
@@ -1170,8 +1185,13 @@ app.post('/webhook',async(req,res)=>{
         await startImageGeneration(event,s,uid,sm);return;
       }
 
-      if(awake(s,uid)&&interaction?.mode==='AI圖片製作模式'){
-        if(await handleImageGenText(event,s,uid,lineName,sm,text))return;
+      // 圖片製作流程以記憶體中的流程狀態為準，避免舊的 LINE互動狀態資料把內容誤送進 AI客服。
+      if(imageGenFlow(uid)){
+        if(await handleImageGenText(event,s,uid,lineName,sm,text))return true;
+      }else if(awake(s,uid)&&interaction?.mode==='AI圖片製作模式'){
+        if(event.replyToken)await lineReply(event.replyToken,'圖片製作狀態已逾時或主機曾重新啟動，請從選單重新選擇「⑥ 圖片製作」。');
+        await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
+        return;
       }
 
       if(awake(s,uid)&&interaction?.mode==='AI課程查詢模式'){
@@ -1255,6 +1275,6 @@ app.post('/webhook',async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v2.8 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.8.1 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

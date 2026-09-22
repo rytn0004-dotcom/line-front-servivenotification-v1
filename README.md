@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.8｜免費圖片製作＋選擇式確認
+# LINE 客服系統 V2.8.1｜免費圖片製作＋選擇式確認
 
 本版以 V2.7.1 為基礎，新增「⑥ 圖片製作」，圖片生成不使用 Gemini 生圖模型，也不啟用任何付費 Gemini 圖片 API。
 
@@ -32,7 +32,7 @@ Cloudflare Workers AI 目前在 Free plan 提供每日 10,000 Neurons 的免費�
 若兩者都有設定，以 Google Sheet `系統設定` 的值優先；Render 環境變數是無設定該列時的備援。
 
 ## Cloudflare Token 建立
-Cloudflare Dashboard → Workers AI → Use REST API → Create a Workers AI API Token，並取得 Account ID。Token 權限至少需要 Account → Workers AI → Read。
+Cloudflare Dashboard → Workers AI → Use REST API → Create a Workers AI API Token，並取得 Account ID。目前 Cloudflare REST API 建立的 Workers AI Token 需要 `Workers AI - Read` 與 `Workers AI - Edit` 權限。
 
 ## 目前免費生圖資源保護預設
 - 每人每日免費圖片：2 張
@@ -44,8 +44,16 @@ Cloudflare Dashboard → Workers AI → Use REST API → Create a Workers AI API
 以上可在 Google Sheet「系統設定」調整，不需要改 server.js。
 
 ## Excel 規格
-AI 額度管理的既有 G 欄剩餘次數公式維持不變；V2.8 另使用 Q/R 欄記錄「今日生圖次數／生圖額度日期」，不覆蓋 G/H 公式。
+AI 額度管理的既有 G 欄剩餘次數公式維持不變；V2.8.1 另使用 Q/R 欄記錄「今日生圖次數／生圖額度日期」，不覆蓋 G/H 公式。
 
 ## 注意
 - 本版沒有接 Gemini `gemini-3.1-flash-image`，因目前 Gemini API Free Tier 不提供該圖片模型的免費使用。
 - Cloudflare Workers AI 的免費配置不是永久保證；請以 Cloudflare 當下 Dashboard／官方定價為準。
+
+
+## V2.8.1 修正
+- 圖片製作流程優先使用目前的圖片流程狀態，避免舊的「LINE互動狀態」資料把圖片內容誤送進 AI客服。
+- 若主機重新啟動導致圖片流程暫存遺失，會明確提示重新從選單進入，不會靜默掉回 AI客服。
+- 圖片製作失敗時保留確認流程，成功後才清除狀態，方便稍後重試。
+- 一般文字 AI 等待時間提高；「系統設定」的「AI 請求逾時秒數」現可直接控制整體等待，V2.8.1 範本設為 120 秒。
+- Cloudflare 圖片 API 的 401／403／429 會顯示對應的設定／忙碌提示。

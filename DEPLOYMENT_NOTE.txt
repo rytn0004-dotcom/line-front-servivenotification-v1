@@ -1,8 +1,8 @@
-V2.8 圖片製作部署重點
+V2.8.1 圖片製作部署重點
 
 Render Environment:
 CLOUDFLARE_ACCOUNT_ID=...
-CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_API_TOKEN=...  # Workers AI - Read + Edit
 CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-1-schnell
 CLOUDFLARE_IMAGE_STEPS=4
 PUBLIC_BASE_URL=https://你的Render服務網址.onrender.com
@@ -24,3 +24,5 @@ AI額度管理 Q/R：
 Q 今日生圖次數
 R 生圖額度日期
 G/H 原有公式不覆蓋。
+
+GEMINI_REQUEST_TIMEOUT_MS=120000
