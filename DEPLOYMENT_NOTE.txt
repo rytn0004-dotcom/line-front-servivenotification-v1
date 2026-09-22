@@ -1,4 +1,4 @@
-V2.8.1 圖片製作部署重點
+V2.8.2 圖片製作部署重點
 
 Render Environment:
 CLOUDFLARE_ACCOUNT_ID=...
@@ -25,4 +25,7 @@ Q 今日生圖次數
 R 生圖額度日期
 G/H 原有公式不覆蓋。
 
-GEMINI_REQUEST_TIMEOUT_MS=120000
+GEMINI_REQUEST_TIMEOUT_MS=180000
+
+
+V2.8.2：Cloudflare 圖片錯誤會在 Render Log 顯示 HTTP 狀態、Cloudflare 錯誤代碼/訊息及 CF-Ray（不顯示 API Token）；一般 AI 文字預設等待 180 秒。

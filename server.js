@@ -20,8 +20,8 @@ const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
-const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||120000));
-const DEFAULT_AI_TEXT_WAIT_MS=120000;
+const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||180000));
+const DEFAULT_AI_TEXT_WAIT_MS=180000;
 const DEFAULT_AI_IMAGE_WAIT_MS=90000;
 const DEFAULT_AI_DOCUMENT_WAIT_MS=120000;
 const AI_REPLY_SAFE_WINDOW_MS=50000;
@@ -283,6 +283,19 @@ function buildImagePrompt(f){
   return `Create a ${type} for a LINE user. Style: ${style}. Composition: ${composition}. Main content: ${content}. Generate a clean, readable image. Avoid watermarks, UI screenshots, and unnecessary text. If text must appear in the image, keep it short and legible.`.slice(0,2000);
 }
 function imageGenConfigured(){return !!(process.env.CLOUDFLARE_ACCOUNT_ID&&process.env.CLOUDFLARE_API_TOKEN&&GENERATED_IMAGE_PUBLIC_BASE);}
+function cloudflareErrorSummary(raw,status,requestId=''){
+  let data=null;try{data=JSON.parse(raw);}catch{}
+  const errors=Array.isArray(data?.errors)?data.errors:[];
+  const messages=Array.isArray(data?.messages)?data.messages:[];
+  const first=errors[0]||messages[0]||null;
+  return {
+    status:Number(status||0),
+    code:Number(first?.code||0)||0,
+    message:String(first?.message||'').slice(0,600),
+    requestId:String(requestId||'').slice(0,120),
+    body:String(raw||'').replace(/(Bearer\s+)[^\s"']+/ig,'$1[REDACTED]').slice(0,1200)
+  };
+}
 async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GEN_MAX_WAIT_MS){
   if(!process.env.CLOUDFLARE_ACCOUNT_ID||!process.env.CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
   if(!GENERATED_IMAGE_PUBLIC_BASE)throw new Error('IMAGE_PUBLIC_BASE_NOT_CONFIGURED');
@@ -290,12 +303,21 @@ async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GE
   try{
     const encodedModel=String(model).split('/').map(x=>encodeURIComponent(x)).join('/');
     const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`;
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${process.env.CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${process.env.CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
     const raw=await r.text();
-    if(!r.ok){const e=new Error(`Cloudflare image ${r.status}: ${raw.slice(0,300)}`);e.code=r.status;throw e;}
-    let data;try{data=JSON.parse(raw);}catch{throw new Error('Cloudflare image invalid JSON');}
+    const requestId=r.headers.get('cf-ray')||r.headers.get('cf-request-id')||'';
+    if(!r.ok){
+      const info=cloudflareErrorSummary(raw,r.status,requestId);
+      const e=new Error(`Cloudflare image ${r.status}: ${info.message||raw.slice(0,300)}`);e.code=r.status;e.providerDetails=info;throw e;
+    }
+    let data;try{data=JSON.parse(raw);}catch{const e=new Error('Cloudflare image invalid JSON');e.code=502;e.providerDetails=cloudflareErrorSummary(raw,r.status,requestId);throw e;}
+    if(data?.success===false || (Array.isArray(data?.errors)&&data.errors.length)){
+      const info=cloudflareErrorSummary(raw,r.status||502,requestId);const e=new Error(`Cloudflare image ${info.code||r.status||502}: ${info.message||'provider returned errors'}`);e.code=info.status||502;e.providerDetails=info;throw e;
+    }
     const b64=data?.result?.image||data?.result?.output_image||data?.image||'';
-    if(!b64||typeof b64!=='string')throw new Error('Cloudflare image response missing image');
+    if(!b64||typeof b64!=='string'){
+      const e=new Error('Cloudflare image response missing image');e.code=502;e.providerDetails=cloudflareErrorSummary(raw,r.status||200,requestId);throw e;
+    }
     return Buffer.from(b64,'base64');
   }catch(e){if(e?.name==='AbortError'){const err=new Error('IMAGE_GENERATION_TIMEOUT');err.code=408;throw err;}throw e;}finally{clearTimeout(timer);}
 }
@@ -396,15 +418,24 @@ async function handleImageGenPostback(event,s,uid,lineName,sm){
       await withLineLoading(uid,60,()=>performImageGeneration(event,s,uid,lineName,sm,flow,startedAt));
       clearImageGenFlow(uid);
     }catch(e){
-      console.error('image generation',e.message);
-      const code=Number(e?.code||0);
+      const code=Number(e?.code||0)||errorCode(e);
+      console.error('image generation failed',{
+        message:e?.message||'unknown',code,
+        model:imageSetting(sm,'圖片生成模型','CLOUDFLARE_IMAGE_MODEL',IMAGE_GEN_DEFAULT_MODEL),
+        accountId:String(process.env.CLOUDFLARE_ACCOUNT_ID||'').replace(/^(.{6}).*(.{4})$/,'$1…$2')||'(未設定)',
+        providerDetails:e?.providerDetails||null
+      });
       const msg=e.message==='IMAGE_USER_LIMIT'?'您今天的免費圖片製作次數已達上限，請明天再試。':
         e.message==='IMAGE_GLOBAL_LIMIT'?'今天的免費圖片製作資源已達系統上限，請稍後再次嘗試。':
         e.message==='IMAGE_PROVIDER_NOT_CONFIGURED'?'目前免費圖片製作通道尚未完成設定，請聯絡管理員。':
         e.message==='IMAGE_PUBLIC_BASE_NOT_CONFIGURED'?'圖片服務的回傳網址尚未設定，請聯絡管理員。':
         e.message==='IMAGE_GENERATION_TIMEOUT'?'圖片製作等待時間較長，這次沒有完成。您可以稍後再次按「確認製作」。':
-        code===429?'圖片製作通道目前忙碌，請稍後再次按「確認製作」。':
-        code===401||code===403?'圖片製作通道驗證失敗，請聯絡管理員檢查 Cloudflare 設定。':
+        code===400||code===422?'圖片製作請求格式有誤，請稍後重新製作。':
+        code===401?'圖片製作 Token 驗證失敗，請管理員重新檢查 Cloudflare API Token。':
+        code===403?'圖片製作權限不足，請管理員檢查 Cloudflare 的 Workers AI 權限與 Account。':
+        code===404?'圖片製作模型或 API 路徑不存在，請管理員檢查圖片模型設定。':
+        code===429?'圖片製作通道目前忙碌或達到額度限制，請稍後再次按「確認製作」。':
+        code>=500&&code<600?'圖片製作服務目前暫時忙碌，請稍後再次按「確認製作」。':
         '目前無法完成圖片製作，您可以稍後再次按「確認製作」。';
       try{await replyOrPush(event,uid,msg,startedAt);}catch{}
     }
@@ -1135,6 +1166,15 @@ app.post('/webhook',async(req,res)=>{
       if(text==='取消'||text==='取消互動'){clearHistory(uid);await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。\n\n如需服務，請輸入「選單」。');return;}
       if(looksLikeInternalInfoProbe(text)){if(event.replyToken)await lineReply(event.replyToken,INTERNAL_INFO_REPLY);return;}
 
+      // 圖片製作進行中時，優先處理圖片流程，避免數字 1~6 被誤當成主選單快捷鍵。
+      if(imageGenFlow(uid)){
+        if(await handleImageGenText(event,s,uid,lineName,sm,text))return true;
+      }else if(awake(s,uid)&&findInteraction(s,uid)?.mode==='AI圖片製作模式'){
+        if(event.replyToken)await lineReply(event.replyToken,'圖片製作狀態已逾時或主機曾重新啟動，請從選單重新選擇「⑥ 圖片製作」。');
+        await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
+        return;
+      }
+
       if(text==='1'||text==='LINE綁定'||text==='綁定'||text==='開始綁定'||text==='重新綁定'||text==='更正綁定'){
         const b=findBinding(s,uid),c=contactByUid(s,uid);await saveInteraction(s,uid,'綁定模式',taipei(minutes*60000));
         if(!b||b.status!=='BOUND'){await saveBinding(s,uid,'WAIT_ROLE',{flow:'initial',initialRebindCount:0});if(event.replyToken)await lineReply(event.replyToken,bindStart());return;}
@@ -1183,15 +1223,6 @@ app.post('/webhook',async(req,res)=>{
 
       if(text==='⑥ 圖片製作'||text==='6' || text==='圖片製作'){
         await startImageGeneration(event,s,uid,sm);return;
-      }
-
-      // 圖片製作流程以記憶體中的流程狀態為準，避免舊的 LINE互動狀態資料把內容誤送進 AI客服。
-      if(imageGenFlow(uid)){
-        if(await handleImageGenText(event,s,uid,lineName,sm,text))return true;
-      }else if(awake(s,uid)&&interaction?.mode==='AI圖片製作模式'){
-        if(event.replyToken)await lineReply(event.replyToken,'圖片製作狀態已逾時或主機曾重新啟動，請從選單重新選擇「⑥ 圖片製作」。');
-        await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
-        return;
       }
 
       if(awake(s,uid)&&interaction?.mode==='AI課程查詢模式'){
@@ -1275,6 +1306,6 @@ app.post('/webhook',async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v2.8.1 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.8.2 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));
