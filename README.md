@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.8.2｜免費圖片製作＋選擇式確認
+# LINE 客服系統 V2.8.3｜免費圖片製作＋Gemini 多模型額度自動切換
 
 本版以 V2.7.1 為基礎，新增「⑥ 圖片製作」，圖片生成不使用 Gemini 生圖模型，也不啟用任何付費 Gemini 圖片 API。
 
@@ -65,3 +65,15 @@ AI 額度管理的既有 G 欄剩餘次數公式維持不變；V2.8.2 另使用 
 - Cloudflare 圖片錯誤改成分辨 400/401/403/404/429/5xx，並在 Render Log 記錄 Cloudflare 回傳的錯誤代碼、訊息與 CF-Ray（不記錄 API Token）。
 - 圖片製作流程進行中時優先處理圖片流程，避免數字快捷鍵意外跳到其他功能。
 - 圖片失敗時保留目前圖片製作確認流程，可重新按「確認製作」。
+
+
+## V2.8.3 修正
+- 修正 Gemini 多專案備援路由：同一個 Project 的第一個模型收到 429 時，不再直接跳過整個 Project。
+- 429 會先冷卻「Project＋Model」，立即嘗試同一 Project 的下一個模型，再進入下一個 Project。
+- 若 Google API 回覆明確屬於 quota exceeded / 每日配額限制，該模型會進入較長的配額冷卻，避免每次使用者請求都重複撞同一個已用完的模型。
+- 只有 401／403 才會暫時鎖定整個 Project，避免錯誤的 API 權限設定造成無限重試。
+- 預設模型順序保留高階 Flash，同時加入 `gemini-3.5-flash-lite` 與 `gemini-3.1-flash-lite` 作為更輕量的備援。
+- `GEMINI_MODEL_QUOTA_COOLDOWN_MS` 預設 21600000（6 小時），可於 Render 調整。
+
+## 針對 429 的行為
+Google Gemini API 的 rate limits 是以 Project 為單位，而限制也依模型而異；因此 V2.8.3 不再把同一 Project 的所有模型一起視為失效。當某個 Project／Model 回傳 429 時，會依序嘗試同專案的其他模型與其他專案。

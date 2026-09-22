@@ -20,6 +20,7 @@ const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
+const GEMINI_MODEL_QUOTA_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_QUOTA_COOLDOWN_MS||21600000));
 const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||180000));
 const DEFAULT_AI_TEXT_WAIT_MS=180000;
 const DEFAULT_AI_IMAGE_WAIT_MS=90000;
@@ -710,11 +711,14 @@ function providerReady(name){
 function configuredProviders(){return AI_PROVIDER_ORDER.filter(providerReady);}
 function cooldownKey(projectId,model){return `gemini:${projectId}:${model}`;}
 function modelIsCooling(projectId,model){return Number(ai.modelCooldowns.get(cooldownKey(projectId,model))||0)>Date.now();}
-function setModelCooldown(projectId,model,status,retryAfterMs=0){
+function setModelCooldown(projectId,model,status,retryAfterMs=0,isQuotaExceeded=false){
   const code=Number(status||0);
   let duration=GEMINI_MODEL_COOLDOWN_MS;
   if([401,403,404].includes(code))duration=GEMINI_MODEL_LONG_COOLDOWN_MS;
-  if(code===429&&retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
+  if(code===429){
+    if(isQuotaExceeded)duration=GEMINI_MODEL_QUOTA_COOLDOWN_MS;
+    else if(retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
+  }
   ai.modelCooldowns.set(cooldownKey(projectId,model),Date.now()+duration);
 }
 function clearModelCooldown(projectId,model){ai.modelCooldowns.delete(cooldownKey(projectId,model));}
@@ -767,7 +771,19 @@ async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTo
     err.code=e?.name==='AbortError'?408:502;err.model=model;err.projectId=projectId;throw err;
   }finally{clearTimeout(timer);}
   const retryAfterHeader=Number(r.headers.get('retry-after')||0);
-  if(!r.ok){const e=new Error(`Gemini ${r.status} [${projectId}/${model}]: ${raw.slice(0,300)}`);e.code=r.status;e.model=model;e.projectId=projectId;e.retryAfterMs=retryAfterHeader>0?retryAfterHeader*1000:0;throw e;}
+  if(!r.ok){
+    let bodyRetryAfterMs=0;
+    let parsedError=null;
+    try{parsedError=JSON.parse(raw)?.error||null;}catch{}
+    const retryDelayText=String(parsedError?.details?.find?.(d=>d?.retryDelay)?.retryDelay||'');
+    const retryDelayMatch=retryDelayText.match(/(\d+(?:\.\d+)?)s/i);
+    if(retryDelayMatch)bodyRetryAfterMs=Math.round(Number(retryDelayMatch[1])*1000);
+    const retryAfterMs=Math.max(retryAfterHeader>0?retryAfterHeader*1000:0,bodyRetryAfterMs);
+    const quotaExceeded=/(exceeded your current quota|quota.*exceed|requests per day|generateRequestsPerDayPerProjectPerModel|quota_metric|resource_exhausted)/i.test(raw);
+    const e=new Error(`Gemini ${r.status} [${projectId}/${model}]: ${raw.slice(0,500)}`);
+    e.code=r.status;e.model=model;e.projectId=projectId;e.retryAfterMs=retryAfterMs;e.isQuotaExceeded=quotaExceeded;
+    throw e;
+  }
   let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Gemini invalid JSON [${projectId}/${model}]`);e.code=500;e.model=model;e.projectId=projectId;throw e;}
   const candidate=data?.candidates?.[0]||{};
   const answer=String(candidate?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();
@@ -865,9 +881,20 @@ async function aiGenerate(uid,text,context,opts={}){
           return {answer:display,provider:`gemini:${project.id}:${model}`,model,finishReason:result.finishReason||'',usageMetadata:result.usageMetadata||null};
         }catch(e){
           lastErr=e;const code=errorCode(e);
-          if(code===429){setProjectCooldown(project.id,code,e.retryAfterMs||0);setModelCooldown(project.id,model,code,e.retryAfterMs||0);}else if([401,403].includes(code)){setProjectCooldown(project.id,code,e.retryAfterMs||0);}else if([404,408,409,500,502,503,504].includes(code)){setModelCooldown(project.id,model,code,e.retryAfterMs||0);}
+          if(code===429){
+            setModelCooldown(project.id,model,code,e.retryAfterMs||0,!!e.isQuotaExceeded);
+            console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:!!e.isQuotaExceeded,retryAfterMs:e.retryAfterMs||0,next:'next-model'});
+          }else if([401,403].includes(code)){
+            setProjectCooldown(project.id,code,e.retryAfterMs||0);
+            console.error('AI Gemini project authentication/permission failed',{project:project.id,model,code});
+            break;
+          }else if([404,408,409,500,502,503,504].includes(code)){
+            setModelCooldown(project.id,model,code,e.retryAfterMs||0);
+          }
           console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
-          if(code===429||[401,403].includes(code))break;
+          // 429 代表目前這個「專案＋模型」被限流/用量限制；不要把整個 Project 鎖死。
+          // 讓同一 Project 的下一個模型立即接手，再換下一個 Project。
+          if([401,403].includes(code))break;
         }
       }
     }
@@ -885,6 +912,7 @@ async function aiGenerate(uid,text,context,opts={}){
     }
   }
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
+  console.error('AI_ALL_PROVIDERS_FAILED summary',{uid,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastMessage:lastErr?.message||'unknown'});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
 
