@@ -91,3 +91,23 @@ V2.8.5：即使 GEMINI_MODEL_ORDER 只設定單一模型，程式也會自動補
 V2.8.5 啟動時會用 Cloudflare 的 Model Search API 做「不消耗圖片生成額度」的 Token/Account 驗證，Render Log 會顯示 `Cloudflare Workers AI auth preflight OK` 或實際 HTTP 錯誤碼。
 
 一般 AI 客服等待時間最低 180 秒；LINE loading 會每 20 秒重新啟動一次，避免長時間等待時畫面提早停止。
+
+
+## V2.8.6 修正
+- 一般 AI 客服加入更穩定的 Cloudflare 文字雙模型備援：預設先用 `@cf/google/gemma-4-26b-a4b-it`，失敗時再嘗試 `@cf/zai-org/glm-4.7-flash`。
+- Cloudflare 文字模型預設啟用 `rejectIfBusy`；容量忙碌時快速回傳錯誤，不讓請求長時間卡在容量佇列。Cloudflare 自 2026-09-17 起支援此設定。
+- 預設關閉 Gemma 4 thinking，以降低一般客服延遲；可用 `CLOUDFLARE_TEXT_ENABLE_THINKING=true` 開啟。
+- Render Log 會逐一記錄 Cloudflare 文字模型失敗的 HTTP 狀態與模型，成功時記錄實際使用模型與耗時；不記錄 API Token。
+- 一般客服 Prompt 強化：先理解問題、避免單一關鍵字誤判功能、缺資訊只追問必要內容、減少制式句、回答更具體自然。
+- 圖片 Prompt 強化：依圖片類型、風格、構圖提供專業視覺指引，活動海報／宣傳圖會特別要求資訊層級、留白、焦點與可讀性；使用者未指定的文字不自行添加。
+- 不修改 Google Sheet 結構，不覆蓋 AI額度管理 G/H 原有公式。
+
+### V2.8.6 Render 新增（可直接使用預設值）
+`CLOUDFLARE_TEXT_MODEL=@cf/google/gemma-4-26b-a4b-it`
+`CLOUDFLARE_TEXT_MODEL_ORDER=@cf/google/gemma-4-26b-a4b-it,@cf/zai-org/glm-4.7-flash`
+`CLOUDFLARE_TEXT_REJECT_IF_BUSY=true`
+`CLOUDFLARE_TEXT_ENABLE_THINKING=false`
+`CLOUDFLARE_TEXT_TIMEOUT_MS=60000`
+`ENABLE_CLOUDFLARE_TEXT_FALLBACK=true`
+
+Gemma 4 26B A4B 目前仍列於 Workers AI 可用模型；Cloudflare 官方文件提供 REST `/ai/run` 的 `messages` 用法。Cloudflare 於 2026-09-17 新增 `rejectIfBusy`，可避免同步推論在容量不足時等待佇列。
