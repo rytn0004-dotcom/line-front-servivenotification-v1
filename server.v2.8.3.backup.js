@@ -12,20 +12,16 @@ const TZ=process.env.TIMEZONE||'Asia/Taipei';
 const SHEET_ID=process.env.GOOGLE_SHEET_ID||'';
 const LINE_SECRET=process.env.LINE_CHANNEL_SECRET||'';
 const LINE_TOKEN=process.env.LINE_CHANNEL_ACCESS_TOKEN||'';
-const GEMINI_API_KEY=String(process.env.GEMINI_API_KEY||'').trim();
-const GEMINI_API_KEY_B=String(process.env.GEMINI_API_KEY_B||'').trim();
-const GEMINI_API_KEY_C=String(process.env.GEMINI_API_KEY_C||'').trim();
-const GEMINI_FALLBACK_MODELS=['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-3.1-flash-lite'];
-const GEMINI_CONFIGURED_MODELS=String(process.env.GEMINI_MODEL_ORDER||'').split(',').map(x=>x.trim()).filter(Boolean);
-// 即使 Render 只填單一模型，也自動補齊可用備援模型。
-const GEMINI_MODEL_ORDER=Array.from(new Set([...GEMINI_CONFIGURED_MODELS,...GEMINI_FALLBACK_MODELS]));
+const GEMINI_API_KEY=process.env.GEMINI_API_KEY||'';
+const GEMINI_API_KEY_B=process.env.GEMINI_API_KEY_B||'';
+const GEMINI_API_KEY_C=process.env.GEMINI_API_KEY_C||'';
+const GEMINI_MODEL_ORDER=String(process.env.GEMINI_MODEL_ORDER||'gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite').split(',').map(x=>x.trim()).filter(Boolean);
 const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
 const GEMINI_MODEL_QUOTA_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_QUOTA_COOLDOWN_MS||21600000));
-// 單一模型最長等待 90 秒；整體等待仍由系統設定的「AI 一般最長等待秒數」控制。
-const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||90000));
+const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||180000));
 const DEFAULT_AI_TEXT_WAIT_MS=180000;
 const DEFAULT_AI_IMAGE_WAIT_MS=90000;
 const DEFAULT_AI_DOCUMENT_WAIT_MS=120000;
@@ -57,9 +53,7 @@ const DEFAULT_IMAGE_GEN_MAX_WAIT_MS=90000;
 const DEFAULT_IMAGE_GEN_CONCURRENCY=1;
 const DEFAULT_GENERATED_IMAGE_TTL_MS=15*60*1000;
 const GENERATED_IMAGE_DIR=process.env.GENERATED_IMAGE_DIR||path.join('/tmp','line-customer-generated-images');
-const CLOUDFLARE_ACCOUNT_ID=String(process.env.CLOUDFLARE_ACCOUNT_ID||'').trim();
-const CLOUDFLARE_API_TOKEN=String(process.env.CLOUDFLARE_API_TOKEN||'').trim();
-const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').trim().replace(/\/$/,'');
+const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').replace(/\/$/,'');
 const MEDIA_RESOURCE_SHEET_COLUMNS={bytes:14,date:15}; // O/P; keep G/H formulas untouched.
 const MEDIA_UPLOAD_TEMP_DIR=process.env.MEDIA_UPLOAD_TEMP_DIR||'/tmp/line-customer-media';
 const AI_MAX_HISTORY_TURNS=Math.max(1,Number(process.env.AI_MAX_HISTORY_TURNS||6));
@@ -289,7 +283,7 @@ function buildImagePrompt(f){
   const type=f.type||'一般圖片',style=f.style||'自然清楚',composition=f.composition||'正方形構圖',content=String(f.content||'').trim().slice(0,1200);
   return `Create a ${type} for a LINE user. Style: ${style}. Composition: ${composition}. Main content: ${content}. Generate a clean, readable image. Avoid watermarks, UI screenshots, and unnecessary text. If text must appear in the image, keep it short and legible.`.slice(0,2000);
 }
-function imageGenConfigured(){return !!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN&&GENERATED_IMAGE_PUBLIC_BASE);}
+function imageGenConfigured(){return !!(process.env.CLOUDFLARE_ACCOUNT_ID&&process.env.CLOUDFLARE_API_TOKEN&&GENERATED_IMAGE_PUBLIC_BASE);}
 function cloudflareErrorSummary(raw,status,requestId=''){
   let data=null;try{data=JSON.parse(raw);}catch{}
   const errors=Array.isArray(data?.errors)?data.errors:[];
@@ -304,13 +298,13 @@ function cloudflareErrorSummary(raw,status,requestId=''){
   };
 }
 async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GEN_MAX_WAIT_MS){
-  if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
+  if(!process.env.CLOUDFLARE_ACCOUNT_ID||!process.env.CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
   if(!GENERATED_IMAGE_PUBLIC_BASE)throw new Error('IMAGE_PUBLIC_BASE_NOT_CONFIGURED');
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeoutMs);
   try{
     const encodedModel=String(model).split('/').map(x=>encodeURIComponent(x)).join('/');
-    const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`;
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
+    const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`;
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${process.env.CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
     const raw=await r.text();
     const requestId=r.headers.get('cf-ray')||r.headers.get('cf-request-id')||'';
     if(!r.ok){
@@ -381,7 +375,7 @@ async function storeGeneratedImage(buffer){
   return {originalUrl:`${GENERATED_IMAGE_PUBLIC_BASE}/generated-image/${token}`,previewUrl:`${GENERATED_IMAGE_PUBLIC_BASE}/generated-image/${token}?preview=1`};
 }
 async function performImageGeneration(event,s,uid,lineName,settings,flow,startedAt){
-  if(!imageGenConfigured())throw new Error(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN?'IMAGE_PUBLIC_BASE_NOT_CONFIGURED':'IMAGE_PROVIDER_NOT_CONFIGURED');
+  if(!imageGenConfigured())throw new Error(process.env.CLOUDFLARE_ACCOUNT_ID&&process.env.CLOUDFLARE_API_TOKEN?'IMAGE_PUBLIC_BASE_NOT_CONFIGURED':'IMAGE_PROVIDER_NOT_CONFIGURED');
   const model=imageSetting(settings,'圖片生成模型','CLOUDFLARE_IMAGE_MODEL',IMAGE_GEN_DEFAULT_MODEL);
   const steps=imageNumberSetting(settings,'圖片生成步數','CLOUDFLARE_IMAGE_STEPS',DEFAULT_IMAGE_GEN_STEPS,1,8);
   const waitMs=imageNumberSetting(settings,'圖片生成最長等待秒數','CLOUDFLARE_IMAGE_TIMEOUT_MS',DEFAULT_IMAGE_GEN_MAX_WAIT_MS,15000,180000);
@@ -429,7 +423,7 @@ async function handleImageGenPostback(event,s,uid,lineName,sm){
       console.error('image generation failed',{
         message:e?.message||'unknown',code,
         model:imageSetting(sm,'圖片生成模型','CLOUDFLARE_IMAGE_MODEL',IMAGE_GEN_DEFAULT_MODEL),
-        accountId:String(CLOUDFLARE_ACCOUNT_ID||'').replace(/^(.{6}).*(.{4})$/,'$1…$2')||'(未設定)',
+        accountId:String(process.env.CLOUDFLARE_ACCOUNT_ID||'').replace(/^(.{6}).*(.{4})$/,'$1…$2')||'(未設定)',
         providerDetails:e?.providerDetails||null
       });
       const msg=e.message==='IMAGE_USER_LIMIT'?'您今天的免費圖片製作次數已達上限，請明天再試。':
@@ -870,7 +864,6 @@ async function aiGenerate(uid,text,context,opts={}){
   const externalProviders=allowExternal?configuredProviders().filter(name=>name!=='gemini'):[];
   if(geminiProjects().length===0&&externalProviders.length===0){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
   let lastErr=null;
-  const attempts=[];
   const geminiProjectsList=geminiProjects();
   if(geminiProjectsList.length){
     outer: for(const project of geminiProjectsList){
@@ -881,7 +874,6 @@ async function aiGenerate(uid,text,context,opts={}){
         const remaining=deadline-Date.now();
         const timeoutMs=Math.max(15000,Math.min(GEMINI_REQUEST_TIMEOUT_MS,remaining));
         try{
-          attempts.push({project:project.id,model,timeoutMs});
           const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch});
           const display=String(result.answer).trim();
           if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
@@ -920,7 +912,7 @@ async function aiGenerate(uid,text,context,opts={}){
     }
   }
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
-  console.error('AI_ALL_PROVIDERS_FAILED summary',{uid,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastMessage:lastErr?.message||'unknown',attempts:attempts.map(a=>`${a.project}:${a.model}`)});
+  console.error('AI_ALL_PROVIDERS_FAILED summary',{uid,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastMessage:lastErr?.message||'unknown'});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
 
@@ -1342,6 +1334,6 @@ app.post('/webhook',async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v2.8.4 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.8.2 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));
