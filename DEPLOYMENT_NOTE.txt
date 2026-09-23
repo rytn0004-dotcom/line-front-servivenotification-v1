@@ -30,4 +30,4 @@ GEMINI_REQUEST_TIMEOUT_MS=180000
 
 V2.8.2：Cloudflare 圖片錯誤會在 Render Log 顯示 HTTP 狀態、Cloudflare 錯誤代碼/訊息及 CF-Ray（不顯示 API Token）；一般 AI 文字預設等待 180 秒。
 
-V2.8.4：模型路由會自動補齊 Gemini 備援；建議 GEMINI_REQUEST_TIMEOUT_MS=90000。Cloudflare Token/Account ID 會自動 trim。
+V2.8.5：模型路由會自動補齊 Gemini 備援；建議 GEMINI_REQUEST_TIMEOUT_MS=90000。Cloudflare Token/Account ID 會自動 trim。

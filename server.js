@@ -30,7 +30,7 @@ const DEFAULT_AI_TEXT_WAIT_MS=180000;
 const DEFAULT_AI_IMAGE_WAIT_MS=90000;
 const DEFAULT_AI_DOCUMENT_WAIT_MS=120000;
 const AI_REPLY_SAFE_WINDOW_MS=50000;
-const LINE_LOADING_REFRESH_MS=50000;
+const LINE_LOADING_REFRESH_MS=20000;
 const ENABLE_GOOGLE_SEARCH=/^(1|true|yes|是)$/i.test(String(process.env.AI_ENABLE_GOOGLE_SEARCH||'true'));
 const OPENROUTER_API_KEY=process.env.OPENROUTER_API_KEY||'';
 const OPENROUTER_MODEL=process.env.OPENROUTER_MODEL||'openrouter/free';
@@ -60,6 +60,8 @@ const GENERATED_IMAGE_DIR=process.env.GENERATED_IMAGE_DIR||path.join('/tmp','lin
 const CLOUDFLARE_ACCOUNT_ID=String(process.env.CLOUDFLARE_ACCOUNT_ID||'').trim();
 const CLOUDFLARE_API_TOKEN=String(process.env.CLOUDFLARE_API_TOKEN||'').trim();
 const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').trim().replace(/\/$/,'');
+const CLOUDFLARE_TEXT_MODEL=String(process.env.CLOUDFLARE_TEXT_MODEL||'@cf/zai-org/glm-4.7-flash').trim();
+const ENABLE_CLOUDFLARE_TEXT_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.ENABLE_CLOUDFLARE_TEXT_FALLBACK||'true'));
 const MEDIA_RESOURCE_SHEET_COLUMNS={bytes:14,date:15}; // O/P; keep G/H formulas untouched.
 const MEDIA_UPLOAD_TEMP_DIR=process.env.MEDIA_UPLOAD_TEMP_DIR||'/tmp/line-customer-media';
 const AI_MAX_HISTORY_TURNS=Math.max(1,Number(process.env.AI_MAX_HISTORY_TURNS||6));
@@ -302,6 +304,43 @@ function cloudflareErrorSummary(raw,status,requestId=''){
     requestId:String(requestId||'').slice(0,120),
     body:String(raw||'').replace(/(Bearer\s+)[^\s"']+/ig,'$1[REDACTED]').slice(0,1200)
   };
+}
+async function cloudflareAuthPreflight(){
+  if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN){
+    console.warn('Cloudflare Workers AI auth preflight: NOT_CONFIGURED');
+    return {ok:false,status:0,reason:'NOT_CONFIGURED'};
+  }
+  try{
+    const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/models/search?per_page=1`;
+    const r=await fetch(url,{headers:{Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`,Accept:'application/json'}});
+    const raw=await r.text();
+    if(!r.ok){
+      const info=cloudflareErrorSummary(raw,r.status,r.headers.get('cf-ray')||'');
+      console.error('Cloudflare Workers AI auth preflight FAILED',{status:info.status,code:info.code,message:info.message,accountIdSuffix:CLOUDFLARE_ACCOUNT_ID.slice(-6)});
+      return {ok:false,status:r.status,code:info.code,message:info.message};
+    }
+    console.log('Cloudflare Workers AI auth preflight OK',{accountIdSuffix:CLOUDFLARE_ACCOUNT_ID.slice(-6)});
+    return {ok:true,status:r.status};
+  }catch(e){
+    console.error('Cloudflare Workers AI auth preflight ERROR',e.message);
+    return {ok:false,status:0,reason:e.message};
+  }
+}
+async function callCloudflareTextFallback(systemText,messages,maxTokens,temperature,timeoutMs){
+  if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN)throw Object.assign(new Error('CLOUDFLARE_TEXT_NOT_CONFIGURED'),{code:503});
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/run/${String(CLOUDFLARE_TEXT_MODEL).split('/').map(x=>encodeURIComponent(x)).join('/')}`;
+    const reqMessages=[{role:'system',content:systemText},...messages];
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({messages:reqMessages,max_tokens:maxTokens,temperature}),signal:controller.signal});
+    const raw=await r.text();
+    if(!r.ok){const info=cloudflareErrorSummary(raw,r.status,r.headers.get('cf-ray')||'');const e=new Error(`Cloudflare text ${r.status}: ${info.message||raw.slice(0,300)}`);e.code=r.status;e.providerDetails=info;throw e;}
+    let data;try{data=JSON.parse(raw);}catch{throw Object.assign(new Error('Cloudflare text invalid JSON'),{code:502});}
+    const answer=String(data?.result?.response||data?.result?.text||data?.response||'').trim();
+    if(!answer)throw Object.assign(new Error('Cloudflare text empty'),{code:502});
+    return answer;
+  }catch(e){if(e?.name==='AbortError')throw Object.assign(new Error('Cloudflare text timeout'),{code:408});throw e;}
+  finally{clearTimeout(timer);}
 }
 async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GEN_MAX_WAIT_MS){
   if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
@@ -847,7 +886,7 @@ function needsFreshWeb(text){
 function aiWaitMsFor(kind,settings){
   if(kind==='image')return Math.max(15000,aiSettingNum(settings,'AI 圖片最長等待秒數',90)*1000);
   if(kind==='document')return Math.max(15000,aiSettingNum(settings,'AI 文件最長等待秒數',120)*1000);
-  return Math.max(15000,aiSettingNum(settings,'AI 一般最長等待秒數',aiSettingNum(settings,'AI 請求逾時秒數',120))*1000);
+  return Math.max(180000,aiSettingNum(settings,'AI 一般最長等待秒數',aiSettingNum(settings,'AI 請求逾時秒數',180))*1000);
 }
 function outputTokensFor(kind,settings){
   if(kind==='image')return Math.max(200,aiSettingNum(settings,'AI 圖片回覆最大 Tokens',1000));
@@ -906,6 +945,17 @@ async function aiGenerate(uid,text,context,opts={}){
         }
       }
     }
+  }
+  if(Date.now()<deadline && ENABLE_CLOUDFLARE_TEXT_FALLBACK && !hasMedia && !privateContext && !useSearch && CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN){
+    try{
+      const remaining=deadline-Date.now();
+      const timeoutMs=Math.max(15000,Math.min(60000,remaining));
+      const answer=await callCloudflareTextFallback(systemText,messages,outputMax,opts.temperature??0.2,timeoutMs);
+      const display=String(answer).trim();
+      if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
+      console.log('AI success',{channel:'cloudflare-workers-ai-text',model:CLOUDFLARE_TEXT_MODEL,uid});
+      return {answer:display,provider:`cloudflare:${CLOUDFLARE_TEXT_MODEL}`,model:CLOUDFLARE_TEXT_MODEL};
+    }catch(e){lastErr=e;console.error('Cloudflare text fallback failed',{code:errorCode(e),message:e.message});}
   }
   if(Date.now()<deadline){
     for(const provider of externalProviders){
@@ -1094,10 +1144,10 @@ async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',
 async function lineReplyQuick(token,text,items){await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
 async function linePush(uid,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
 async function linePushMessages(uid,messages){const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
-async function lineLoading(uid,seconds=60){const r=await fetch('https://api.line.me/v2/bot/chat/loading/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({chatId:uid,loadingSeconds:Math.min(60,Math.max(5,Math.round(seconds/5)*5))})});if(!r.ok)throw new Error(`LINE loading ${r.status}: ${await r.text()}`);}
+async function lineLoading(uid,seconds=50){const r=await fetch('https://api.line.me/v2/bot/chat/loading/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({chatId:uid,loadingSeconds:Math.min(60,Math.max(5,Math.round(seconds/5)*5))})});if(!r.ok)throw new Error(`LINE loading ${r.status}: ${await r.text()}`);}
 async function withLineLoading(uid,waitMs,fn){
   let stopped=false;
-  const refresh=async()=>{if(stopped)return;try{await lineLoading(uid,60);}catch(e){console.warn('LINE loading animation',e.message);}};
+  const refresh=async()=>{if(stopped)return;try{await lineLoading(uid,50);}catch(e){console.warn('LINE loading animation',e.message);}};
   await refresh();
   const timer=setInterval(()=>{void refresh();},LINE_LOADING_REFRESH_MS);
   try{return await fn();}finally{stopped=true;clearInterval(timer);}
@@ -1342,6 +1392,6 @@ app.post('/webhook',async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`LINE customer service server v2.8.4 listening on ${PORT}`));
-(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
+app.listen(PORT,()=>console.log(`LINE customer service server v2.8.5 listening on ${PORT}`));
+(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

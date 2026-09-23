@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.8.4｜免費圖片製作＋Gemini 多模型額度自動切換
+# LINE 客服系統 V2.8.5｜免費圖片製作＋Gemini 多模型額度自動切換
 
 本版以 V2.7.1 為基礎，新增「⑥ 圖片製作」，圖片生成不使用 Gemini 生圖模型，也不啟用任何付費 Gemini 圖片 API。
 
@@ -67,7 +67,7 @@ AI 額度管理的既有 G 欄剩餘次數公式維持不變；V2.8.2 另使用 
 - 圖片失敗時保留目前圖片製作確認流程，可重新按「確認製作」。
 
 
-## V2.8.4 修正
+## V2.8.5 修正
 - 修正 Gemini 多專案備援路由：同一個 Project 的第一個模型收到 429 時，不再直接跳過整個 Project。
 - 429 會先冷卻「Project＋Model」，立即嘗試同一 Project 的下一個模型，再進入下一個 Project。
 - 若 Google API 回覆明確屬於 quota exceeded / 每日配額限制，該模型會進入較長的配額冷卻，避免每次使用者請求都重複撞同一個已用完的模型。
@@ -76,7 +76,18 @@ AI 額度管理的既有 G 欄剩餘次數公式維持不變；V2.8.2 另使用 
 - `GEMINI_MODEL_QUOTA_COOLDOWN_MS` 預設 21600000（6 小時），可於 Render 調整。
 
 ## 針對 429 的行為
-Google Gemini API 的 rate limits 是以 Project 為單位，而限制也依模型而異；因此 V2.8.4 不再把同一 Project 的所有模型一起視為失效。當某個 Project／Model 回傳 429 時，會依序嘗試同專案的其他模型與其他專案。
+Google Gemini API 的 rate limits 是以 Project 為單位，而限制也依模型而異；因此 V2.8.5 不再把同一 Project 的所有模型一起視為失效。當某個 Project／Model 回傳 429 時，會依序嘗試同專案的其他模型與其他專案。
 
 
-V2.8.4：即使 GEMINI_MODEL_ORDER 只設定單一模型，程式也會自動補齊 3.8 / 3.7 / 3.6 / 3.5 Flash-Lite / 3.1 Flash-Lite；429 只冷卻該專案＋模型，不會鎖死整個 Project。單模型預設最多等待 90 秒，整體 AI 一般等待仍由系統設定控制。Cloudflare Account ID / API Token 會自動去除前後空白。
+V2.8.5：即使 GEMINI_MODEL_ORDER 只設定單一模型，程式也會自動補齊 3.8 / 3.7 / 3.6 / 3.5 Flash-Lite / 3.1 Flash-Lite；429 只冷卻該專案＋模型，不會鎖死整個 Project。單模型預設最多等待 90 秒，整體 AI 一般等待仍由系統設定控制。Cloudflare Account ID / API Token 會自動去除前後空白。
+
+## V2.8.5 重要設定
+- `CLOUDFLARE_ACCOUNT_ID`：Cloudflare Account ID
+- `CLOUDFLARE_API_TOKEN`：Workers AI API Token
+- `PUBLIC_BASE_URL`：Render 公開 HTTPS 網址
+- `CLOUDFLARE_TEXT_MODEL`：預設 `@cf/zai-org/glm-4.7-flash`，作為 Gemini 不可用時的一般文字客服備援
+- `ENABLE_CLOUDFLARE_TEXT_FALLBACK=true`
+
+V2.8.5 啟動時會用 Cloudflare 的 Model Search API 做「不消耗圖片生成額度」的 Token/Account 驗證，Render Log 會顯示 `Cloudflare Workers AI auth preflight OK` 或實際 HTTP 錯誤碼。
+
+一般 AI 客服等待時間最低 180 秒；LINE loading 會每 20 秒重新啟動一次，避免長時間等待時畫面提早停止。
