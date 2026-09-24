@@ -25,6 +25,8 @@ const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').tri
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
 const GEMINI_MODEL_QUOTA_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_QUOTA_COOLDOWN_MS||21600000));
+const GEMINI_PROJECT_QUOTA_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_PROJECT_QUOTA_COOLDOWN_MS||21600000));
+const GEMINI_503_COOLDOWN_MS=Math.max(5000,Number(process.env.GEMINI_503_COOLDOWN_MS||20000));
 // 單一 Gemini 模型最長等待 90 秒；整體等待仍由系統設定的「AI 一般最長等待秒數」控制。
 // Cloudflare 文字備援另外採用「容量忙碌立即拒絕」策略，避免把時間卡在容量佇列。
 const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||90000));
@@ -68,6 +70,8 @@ const CLOUDFLARE_TEXT_MODEL_ORDER=Array.from(new Set(String(process.env.CLOUDFLA
 const CLOUDFLARE_TEXT_REJECT_IF_BUSY=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_REJECT_IF_BUSY||'true'));
 const CLOUDFLARE_TEXT_ENABLE_THINKING=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_ENABLE_THINKING||'false'));
 const CLOUDFLARE_TEXT_TIMEOUT_MS=Math.max(10000,Number(process.env.CLOUDFLARE_TEXT_TIMEOUT_MS||60000));
+const CLOUDFLARE_TEXT_OPENAI_FIRST=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_OPENAI_FIRST||'true'));
+const CLOUDFLARE_TEXT_EMPTY_COOLDOWN_MS=Math.max(5000,Number(process.env.CLOUDFLARE_TEXT_EMPTY_COOLDOWN_MS||30000));
 const ENABLE_CLOUDFLARE_TEXT_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.ENABLE_CLOUDFLARE_TEXT_FALLBACK||'true'));
 const ALLOW_FRESH_DEGRADED_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.AI_ALLOW_FRESH_DEGRADED_FALLBACK||'true'));
 const AI_ROUTE_FAIL_OPEN=/^(1|true|yes|是)$/i.test(String(process.env.AI_ROUTE_FAIL_OPEN||'true'));
@@ -410,22 +414,18 @@ async function callCloudflareTextFallback(systemText,messages,maxTokens,temperat
   let lastErr=null;
   for(const model of models){
     const encodedModel=String(model).split('/').map(x=>encodeURIComponent(x)).join('/');
-    const attempts=[
-      {kind:'native',url:`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`,
-       body:{messages:reqMessages,max_tokens:maxTokens,temperature,...(CLOUDFLARE_TEXT_REJECT_IF_BUSY?{options:{rejectIfBusy:true}}:{})},
-       parse:data=>String(data?.result?.response||data?.result?.text||data?.response||'').trim()},
-    ];
-    if(AI_CLOUDFLARE_OPENAI_FALLBACK){
-      attempts.push({kind:'openai-compatible',url:`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`,
-        body:{model,messages:reqMessages,max_tokens:maxTokens,temperature},
-        parse:data=>String(data?.choices?.[0]?.message?.content||'').trim()});
-    }
+    const nativeAttempt={kind:'native',url:`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`,
+      body:{messages:reqMessages,max_tokens:maxTokens,temperature,...(CLOUDFLARE_TEXT_REJECT_IF_BUSY?{options:{rejectIfBusy:true}}:{})}};
+    const openaiAttempt={kind:'openai-compatible',url:`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`,
+      body:{model,messages:reqMessages,max_completion_tokens:maxTokens,max_tokens:maxTokens,temperature,stream:false}};
+    const attempts=CLOUDFLARE_TEXT_OPENAI_FIRST&&AI_CLOUDFLARE_OPENAI_FALLBACK?[openaiAttempt,nativeAttempt]:AI_CLOUDFLARE_OPENAI_FALLBACK?[nativeAttempt,openaiAttempt]:[nativeAttempt];
     for(const attempt of attempts){
       const controller=new AbortController();
       const timer=setTimeout(()=>controller.abort(),Math.max(10000,Number(timeoutMs||CLOUDFLARE_TEXT_TIMEOUT_MS)));
       const started=Date.now();
       try{
-        const r=await fetch(attempt.url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`},body:JSON.stringify(attempt.body),signal:controller.signal});
+        const headers={'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`};
+        const r=await fetch(attempt.url,{method:'POST',headers,body:JSON.stringify(attempt.body),signal:controller.signal});
         const raw=await r.text();
         const elapsedMs=Date.now()-started;
         if(!r.ok){
@@ -436,13 +436,25 @@ async function callCloudflareTextFallback(systemText,messages,maxTokens,temperat
           const e=new Error(`Cloudflare text ${r.status} [${model}/${attempt.kind}]: ${info.message||raw.slice(0,300)}`);
           e.code=r.status;e.model=model;e.transport=attempt.kind;e.providerDetails=info;throw e;
         }
-        let data;try{data=JSON.parse(raw);}catch{
-          diagnostics.push({model,transport:attempt.kind,status:r.status,elapsedMs,ok:false,kind:'invalid-json'});
-          const e=new Error(`Cloudflare text invalid JSON [${model}/${attempt.kind}]`);e.code=502;e.model=model;e.transport=attempt.kind;throw e;
+        let data=null;
+        let answer='';
+        const contentType=String(r.headers.get('content-type')||'').toLowerCase();
+        if(contentType.includes('text/event-stream')){
+          answer=extractCloudflareSseText(raw);
+          if(!answer)diagnostics.push({model,transport:attempt.kind,status:r.status,elapsedMs,ok:false,kind:'empty-sse'});
+        }else{
+          try{data=JSON.parse(raw);}catch{
+            diagnostics.push({model,transport:attempt.kind,status:r.status,elapsedMs,ok:false,kind:'invalid-json',contentType});
+            const e=new Error(`Cloudflare text invalid JSON [${model}/${attempt.kind}]`);e.code=502;e.model=model;e.transport=attempt.kind;throw e;
+          }
+          answer=extractCloudflareTextAnswer(data);
+          if(!answer){
+            const sseFallback=extractCloudflareSseText(raw);
+            if(sseFallback)answer=sseFallback;
+          }
         }
-        const answer=extractCloudflareTextAnswer(data);
         if(!answer){
-          const diag=cloudflareTextResponseDiagnostics(data);
+          const diag=data?cloudflareTextResponseDiagnostics(data):{contentType,rawLength:String(raw||'').length};
           diagnostics.push({model,transport:attempt.kind,status:r.status,elapsedMs,ok:false,kind:'empty',...diag});
           console.error('Cloudflare text empty diagnostic',{model,transport:attempt.kind,status:r.status,elapsedMs,...diag});
           const e=new Error(`Cloudflare text empty [${model}/${attempt.kind}]`);e.code=502;e.model=model;e.transport=attempt.kind;e.providerDetails=diag;throw e;
@@ -455,20 +467,23 @@ async function callCloudflareTextFallback(systemText,messages,maxTokens,temperat
           lastErr=Object.assign(new Error(`Cloudflare text timeout [${model}/${attempt.kind}]`),{code:408,model,transport:attempt.kind});
           diagnostics.push({model,transport:attempt.kind,status:408,elapsedMs:Date.now()-started,ok:false,kind:'timeout'});
         }else lastErr=e;
-        if(!(e?.message||'').startsWith('Cloudflare text empty')){
-          console.error('Cloudflare text model failed',{model,transport:attempt.kind,code:errorCode(lastErr),message:lastErr?.message||'unknown'});
-        }
         const code=errorCode(lastErr);
-        if([404].includes(code)&&attempt.kind==='native')continue;
+        if([502].includes(code)&&lastErr?.message?.startsWith('Cloudflare text empty')){
+          ai.modelCooldowns.set(`cloudflare:${model}`,Date.now()+CLOUDFLARE_TEXT_EMPTY_COOLDOWN_MS);
+        }
+        if(!(lastErr?.message||'').startsWith('Cloudflare text empty')){
+          console.error('Cloudflare text model failed',{model,transport:attempt.kind,code,message:lastErr?.message||'unknown'});
+        }
         if(![400,401,403,404,408,409,429,500,502,503,504].includes(code))break;
       }finally{clearTimeout(timer);}
     }
-    const code=errorCode(lastErr);
-    if([401,403].includes(code))break;
+    const cfKey=`cloudflare:${model}`;
+    if(Number(ai.modelCooldowns.get(cfKey)||0)>Date.now()){
+      console.warn('Cloudflare text model skipped',{model,reason:'empty-response-cooldown',remainingMs:Number(ai.modelCooldowns.get(cfKey))-Date.now()});
+    }
   }
   throw lastErr||Object.assign(new Error('Cloudflare text failed'),{code:502});
 }
-
 async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GEN_MAX_WAIT_MS){
   if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
   if(!GENERATED_IMAGE_PUBLIC_BASE)throw new Error('IMAGE_PUBLIC_BASE_NOT_CONFIGURED');
@@ -883,11 +898,13 @@ function setModelCooldown(projectId,model,status,retryAfterMs=0,isQuotaExceeded=
   const code=Number(status||0);
   let duration=GEMINI_MODEL_COOLDOWN_MS;
   if([401,403,404].includes(code))duration=GEMINI_MODEL_LONG_COOLDOWN_MS;
+  if(code===503)duration=GEMINI_503_COOLDOWN_MS;
   if(code===429){
     if(isQuotaExceeded)duration=GEMINI_MODEL_QUOTA_COOLDOWN_MS;
     else if(retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
   }
   ai.modelCooldowns.set(cooldownKey(projectId,model),Date.now()+duration);
+  return duration;
 }
 function clearModelCooldown(projectId,model){ai.modelCooldowns.delete(cooldownKey(projectId,model));}
 function projectIsCooling(projectId){return Number(ai.projectCooldowns.get(projectId)||0)>Date.now();}
@@ -899,18 +916,31 @@ function setProjectCooldown(projectId,status,retryAfterMs=0){
   ai.projectCooldowns.set(projectId,Date.now()+duration);
 }
 function clearProjectCooldown(projectId){ai.projectCooldowns.delete(projectId);}
+function setGeminiProjectQuotaCooldown(projectId,retryAfterMs=0){
+  const duration=Math.min(Math.max(Number(retryAfterMs||0),GEMINI_PROJECT_QUOTA_COOLDOWN_MS),GEMINI_PROJECT_QUOTA_COOLDOWN_MS);
+  ai.projectCooldowns.set(projectId,Date.now()+duration);
+  return duration;
+}
 function geminiModelOrder(projectId){return GEMINI_MODEL_ORDER.filter(m=>!modelIsCooling(projectId,m));}
 function isGeminiModelErrorMessage(msg){return /^Gemini\s+\d{3}\b/i.test(String(msg||''));}
 function historyToMessages(uid){
   return aiHistory(uid).map(x=>({role:x.role==='model'?'assistant':'user',content:String(x?.parts?.map(p=>p?.text||'').join('')||'')})).filter(x=>x.content);
 }
 function textFromContent(value){
+  if(value==null)return '';
   if(typeof value==='string')return value;
+  if(typeof value==='number'||typeof value==='boolean')return String(value);
   if(Array.isArray(value))return value.map(textFromContent).filter(Boolean).join('\n');
   if(value&&typeof value==='object'){
-    if(typeof value.text==='string')return value.text;
-    if(typeof value.content==='string')return value.content;
-    if(Array.isArray(value.content))return textFromContent(value.content);
+    const direct=['text','content','generated_text','output_text','response','answer','message'];
+    for(const key of direct){
+      if(key in value){
+        const out=textFromContent(value[key]);
+        if(out)return out;
+      }
+    }
+    if(Array.isArray(value.parts))return textFromContent(value.parts);
+    if(Array.isArray(value.delta))return textFromContent(value.delta);
   }
   return '';
 }
@@ -919,7 +949,9 @@ function extractCompatAnswer(data){
     data?.choices?.[0]?.message?.content,
     data?.choices?.[0]?.text,
     data?.result?.choices?.[0]?.message?.content,
-    data?.result?.choices?.[0]?.text
+    data?.result?.choices?.[0]?.text,
+    data?.output_text,
+    data?.result?.output_text
   ];
   for(const value of candidates){
     const out=textFromContent(value).trim();
@@ -930,13 +962,18 @@ function extractCompatAnswer(data){
 function cloudflareTextResponseDiagnostics(data){
   const result=data?.result;
   const resultType=Array.isArray(result)?'array':typeof result;
-  const resultKeys=result&&typeof result==='object'&&!Array.isArray(result)?Object.keys(result).slice(0,24):[];
-  const topKeys=data&&typeof data==='object'?Object.keys(data).slice(0,24):[];
+  const resultKeys=result&&typeof result==='object'&&!Array.isArray(result)?Object.keys(result).slice(0,32):[];
+  const topKeys=data&&typeof data==='object'?Object.keys(data).slice(0,32):[];
   const responseCandidates=[
     ['result.response',result?.response],
     ['result.text',result?.text],
     ['response',data?.response],
     ['text',data?.text],
+    ['result.output_text',result?.output_text],
+    ['output_text',data?.output_text],
+    ['result.generated_text',result?.generated_text],
+    ['result.message.content',result?.message?.content],
+    ['result.content',result?.content],
     ['result.choices[0].message.content',result?.choices?.[0]?.message?.content],
     ['choices[0].message.content',data?.choices?.[0]?.message?.content]
   ];
@@ -953,16 +990,35 @@ function extractCloudflareTextAnswer(data){
     data?.result?.text,
     data?.response,
     data?.text,
+    data?.result?.output_text,
+    data?.output_text,
+    data?.result?.generated_text,
+    data?.result?.message?.content,
+    data?.result?.content,
     data?.result?.choices?.[0]?.message?.content,
     data?.choices?.[0]?.message?.content,
     data?.result?.choices?.[0]?.text,
-    data?.choices?.[0]?.text
+    data?.choices?.[0]?.text,
+    data?.result
   ];
   for(const value of candidates){
     const out=textFromContent(value).trim();
     if(out)return out;
   }
   return '';
+}
+function extractCloudflareSseText(raw){
+  const parts=[];
+  for(const line of String(raw||'').split(/\r?\n/)){
+    const payload=line.replace(/^data:\s*/,'').trim();
+    if(!payload||payload==='[DONE]')continue;
+    try{
+      const obj=JSON.parse(payload);
+      const out=textFromContent(obj?.choices?.[0]?.delta?.content||obj?.choices?.[0]?.message?.content||obj?.response||obj?.result?.response||obj?.result?.text||obj?.text||obj?.result);
+      if(out)parts.push(out);
+    }catch{}
+  }
+  return parts.join('').trim();
 }
 async function callOpenAICompatible(provider,systemText,messages,maxOutputTokens,temperature,timeoutMs=30000){
   const url=provider==='openrouter'?OPENROUTER_BASE_URL:GROQ_BASE_URL;
@@ -1129,18 +1185,24 @@ async function aiGenerate(uid,text,context,opts={}){
         }catch(e){
           lastErr=e;const code=errorCode(e);
           if(code===429){
-            setModelCooldown(project.id,model,code,e.retryAfterMs||0,!!e.isQuotaExceeded);
-            console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:!!e.isQuotaExceeded,retryAfterMs:e.retryAfterMs||0,next:'next-model'});
+            if(e.isQuotaExceeded){
+              const projectDuration=setGeminiProjectQuotaCooldown(project.id,e.retryAfterMs||0);
+              skipped.push({scope:'project',project:project.id,reason:'quota-exceeded',remainingMs:projectDuration});
+              console.warn('AI Gemini project quota exceeded; skipping remaining models in project',{project:project.id,model,remainingMs:projectDuration});
+              console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
+              break;
+            }
+            const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,false);
+            console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:false,retryAfterMs:e.retryAfterMs||0,cooldownMs:duration,next:'next-model'});
           }else if([401,403].includes(code)){
             setProjectCooldown(project.id,code,e.retryAfterMs||0);
             console.error('AI Gemini project authentication/permission failed',{project:project.id,model,code});
             break;
           }else if([404,408,409,500,502,503,504].includes(code)){
-            setModelCooldown(project.id,model,code,e.retryAfterMs||0);
+            const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0);
+            console.warn('AI Gemini transient failure; model cooldown applied',{project:project.id,model,code,cooldownMs:duration});
           }
           console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
-          // 429 代表目前這個「專案＋模型」被限流/用量限制；不要把整個 Project 鎖死。
-          // 讓同一 Project 的下一個模型立即接手，再換下一個 Project。
           if([401,403].includes(code))break;
         }
       }
@@ -1177,8 +1239,15 @@ async function aiGenerate(uid,text,context,opts={}){
         }catch(e){
           lastErr=e;
           const code=errorCode(e);
-          if(code===429)setModelCooldown(project.id,model,code,e.retryAfterMs||0,!!e.isQuotaExceeded);
-          else if([401,403].includes(code)){setProjectCooldown(project.id,code,e.retryAfterMs||0);break;}
+          if(code===429){
+            if(e.isQuotaExceeded){
+              const projectDuration=setGeminiProjectQuotaCooldown(project.id,e.retryAfterMs||0);
+              skipped.push({scope:'project',project:project.id,reason:'quota-exceeded-degraded-search',remainingMs:projectDuration});
+              console.warn('AI Gemini degraded retry hit project quota; skipping project',{project:project.id,model,remainingMs:projectDuration});
+              break;
+            }
+            setModelCooldown(project.id,model,code,e.retryAfterMs||0,false);
+          }else if([401,403].includes(code)){setProjectCooldown(project.id,code,e.retryAfterMs||0);break;}
           else if([404,408,409,500,502,503,504].includes(code))setModelCooldown(project.id,model,code,e.retryAfterMs||0);
           console.error('AI Gemini degraded retry failed',{project:project.id,model,code,message:e.message});
         }
@@ -1216,7 +1285,7 @@ async function aiGenerate(uid,text,context,opts={}){
   }
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   if(!lastErr)lastErr=Object.assign(new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE'),{code:503});
-  console.error('AI_ALL_PROVIDERS_FAILED summary',{uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
+  console.error('AI_ALL_PROVIDERS_FAILED summary',{uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
 
@@ -1688,6 +1757,6 @@ function runAIRouteSelfTest(){
   if(failures.length)console.error('AI route self-test FAILED',failures);else console.log('AI route self-test PASS',{cases:cases.length,probeCases:probeCases.length});
 }
 runAIRouteSelfTest();
-app.listen(PORT,()=>console.log(`LINE customer service server v2.9.4 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.9.5 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

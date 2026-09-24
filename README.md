@@ -40,3 +40,17 @@
 6. 不新增額外 Cloudflare 付費／配額消耗型啟動測試；啟動 preflight 仍只做授權檢查。
 7. 保留 V2.9.3 家長測試選單：① LINE綁定、④ AI客服、⑥ 圖片製作。
 8. 不包含 Excel。
+
+
+# V2.9.5 AI Provider 故障修正版
+
+本版針對實際 Render Log 中的 Gemini 503/429 與 Cloudflare 文字模型空回應進行修正：
+
+1. Gemini 429 且明確屬 quota exceeded 時，改為暫時冷卻整個 Project，避免同一 Project 的所有模型逐一重試而浪費等待時間；其他 Project 仍可立即接手。
+2. Gemini 503 高負載採短暫模型冷卻，避免長時間誤鎖。
+3. Cloudflare 文字備援預設優先嘗試 OpenAI-compatible `/v1/chat/completions`，失敗再嘗試原生 `/ai/run`；兩條 transport 都保留。
+4. Cloudflare 文字回應解析擴充：支援 choices、result.response、result.text、output_text、generated_text、message/content、SSE 等常見格式。
+5. Cloudflare 200 但空回應時，會短暫冷卻該模型並繼續下一 transport／下一模型，不再立即結束整條備援。
+6. Render Log 的 AI_ALL_PROVIDERS_FAILED summary 增加 attempt/skip/cloudflare 數量，便於診斷。
+
+本版不新增啟動時實際 AI 推理測試，不會因部署而額外消耗 Gemini 或 Cloudflare 推理配額。

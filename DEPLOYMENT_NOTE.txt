@@ -61,3 +61,11 @@ V2.9.4 AI 診斷重點
 2. Cloudflare 若回 HTTP 200 但沒有文字，會顯示 `Cloudflare text empty diagnostic`，只記錄 response 結構摘要，不記錄 Token／完整 Prompt。
 3. 最終失敗摘要會同時包含 attempts、skipped、cloudflareAttempts。
 4. 不需要新增 Render Environment 變數；沿用 V2.9.3 設定即可。
+
+
+V2.9.5 deployment note
+- Keep the existing Gemini A/B/C environment variables.
+- Keep CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN unchanged if auth preflight is already OK.
+- Optional new defaults are already in .env.example; they can be left at defaults.
+- Do not add the Excel workbook to this ZIP.
+- After deploy, test one simple AI question first; then inspect Render Logs for `AI success` and provider/transport.
