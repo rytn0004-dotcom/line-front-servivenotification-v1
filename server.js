@@ -62,6 +62,7 @@ const GENERATED_IMAGE_DIR=process.env.GENERATED_IMAGE_DIR||path.join('/tmp','lin
 const CLOUDFLARE_ACCOUNT_ID=String(process.env.CLOUDFLARE_ACCOUNT_ID||'').trim();
 const CLOUDFLARE_API_TOKEN=String(process.env.CLOUDFLARE_API_TOKEN||'').trim();
 const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').trim().replace(/\/$/,'');
+const BINDING_GUIDE_PUBLIC_URL=GENERATED_IMAGE_PUBLIC_BASE?`${GENERATED_IMAGE_PUBLIC_BASE}/binding-guide.png`:'';
 const CLOUDFLARE_TEXT_MODEL=String(process.env.CLOUDFLARE_TEXT_MODEL||'@cf/google/gemma-4-26b-a4b-it').trim();
 const CLOUDFLARE_TEXT_MODEL_ORDER=Array.from(new Set(String(process.env.CLOUDFLARE_TEXT_MODEL_ORDER||`${CLOUDFLARE_TEXT_MODEL},@cf/zai-org/glm-4.7-flash`).split(',').map(x=>x.trim()).filter(Boolean)));
 const CLOUDFLARE_TEXT_REJECT_IF_BUSY=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_REJECT_IF_BUSY||'true'));
@@ -1373,6 +1374,13 @@ async function processPendingMediaConfirmed(event,s,uid,lineName,settings,pendin
   });
 }
 
+app.get('/binding-guide.png',(req,res)=>{
+  const file=path.join(__dirname,'public','binding-guide.png');
+  res.setHeader('Content-Type','image/png');
+  res.setHeader('Cache-Control','public, max-age=3600');
+  res.sendFile(file,err=>{if(err&&!res.headersSent)res.status(err.code==='ENOENT'?404:500).end();});
+});
+
 app.get('/generated-image/:token',async(req,res)=>{
   const token=String(req.params.token||'');
   if(!/^[a-f0-9]{48}$/.test(token))return res.status(404).end();
@@ -1401,7 +1409,23 @@ app.post('/webhook',async(req,res)=>{
         if(messageType==='image'||messageType==='file'){await handleMediaMessage(event,s,uid,lineName,sm);}
         return;
       }
-      if(text===kw||text==='功能選單'){await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,`您好，請選擇您要使用的功能：\n\n① LINE綁定\n② 課程查詢\n③ 繳費／收據\n④ AI客服\n⑤ 人工客服\n⑥ 圖片製作\n\n輸入「取消」可離開互動模式。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`);return;}
+      if(text===kw||text==='功能選單'){
+        await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));
+        const menuText=`您好，請選擇您要使用的功能：(請先完成line綁定，再進行其他查詢)\n\n（目前測試開放：① ④ ⑥）\n① LINE綁定\n② 課程查詢（目前尚未開放）\n③ 繳費／收據（目前尚未開放）\n④ AI客服\n⑤ 人工客服（目前尚未開放）\n⑥ 圖片製作\n輸入「取消」可離開互動模式。 ※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;
+        const b=findBinding(s,uid), c=contactByUid(s,uid), isBound=!!(b&&b.status==='BOUND')||c?.status==='已綁定';
+        if(event.replyToken && !isBound && BINDING_GUIDE_PUBLIC_URL){
+          try{
+            await lineReplyPayload(event.replyToken,[
+              {type:'text',text:formatForLine(menuText)},
+              {type:'image',originalContentUrl:BINDING_GUIDE_PUBLIC_URL,previewImageUrl:BINDING_GUIDE_PUBLIC_URL}
+            ]);
+          }catch(e){
+            console.warn('Binding guide image send failed',e.message);
+            await lineReply(event.replyToken,menuText);
+          }
+        }else if(event.replyToken) await lineReply(event.replyToken,menuText);
+        return;
+      }
       if(text==='取消'||text==='取消互動'){clearHistory(uid);await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。\n\n如需服務，請輸入「選單」。');return;}
       if(looksLikeInternalInfoProbe(text)){if(event.replyToken)await lineReply(event.replyToken,INTERNAL_INFO_REPLY);return;}
 
@@ -1425,12 +1449,13 @@ app.post('/webhook',async(req,res)=>{
         if(event.replyToken)await lineReply(event.replyToken,`您已完成 LINE 綁定。\n\n${bindingSummary(b.data)}\n\n課表查詢權限：${c?.permission==='是'?'已開啟':'尚未開啟'}\n\n剛完成綁定時，${BIND_GRACE_MINUTES} 分鐘內可用「更正綁定」修正一次。`);return;
       }
       if(text==='2'||text==='課程查詢'){
+        if(event.replyToken){await lineReply(event.replyToken,'目前家長測試暫未開放「② 課程查詢」，本次測試請先使用① LINE綁定、④ AI客服、⑥ 圖片製作。');}return;
         const aiIdle=Number(sm['AI 對話閒置分鐘數']||25)||25;
         const c=contactByUid(s,uid);if(!c||c.status!=='已綁定'){if(event.replyToken)await lineReply(event.replyToken,'課程查詢需要先完成 LINE 綁定。');return;}if(c.permission!=='是'){if(event.replyToken)await lineReply(event.replyToken,'您的課表查詢權限尚未開啟。綁定已完成，但需管理員在後台確認後才能查詢。');return;}if(geminiProjects().length===0&&configuredProviders().length===0){if(event.replyToken)await lineReply(event.replyToken,'課程查詢 AI 尚未設定，請使用人工客服。');return;}await saveInteraction(s,uid,'AI課程查詢模式',taipei(aiIdle*60000));clearHistory(uid);if(event.replyToken)await lineReply(event.replyToken,'已進入課程查詢。\n\n例如：「我小孩星期六幾點上課？」\n\n系統只會使用您已授權的課程資料。');return;
       }
       if(text==='3'||text==='繳費／收據'||text==='繳費/收據'){if(event.replyToken)await lineReply(event.replyToken,'目前繳費／收據服務尚未啟用，請使用人工客服。');return;}
       if(text==='4'||text==='AI客服'||text==='AI 客服'){const aiIdle=Number(sm['AI 對話閒置分鐘數']||25)||25;const cloudflareTextReady=ENABLE_CLOUDFLARE_TEXT_FALLBACK&&!!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN);if(geminiProjects().length===0&&configuredProviders().length===0&&!cloudflareTextReady){if(event.replyToken)await lineReply(event.replyToken,'AI 客服尚未設定可用的 AI 通道，目前請使用人工客服。');return;}clearHistory(uid);await saveInteraction(s,uid,'AI客服模式',taipei(aiIdle*60000));if(event.replyToken)await lineReply(event.replyToken,'已進入 AI 客服。請直接輸入您的問題。\n\n輸入「取消」可離開。');return;}
-      if(text==='5'||text==='人工客服'){clearHistory(uid);await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,'已進入人工客服服務，請直接留言。');return;}
+      if(text==='5'||text==='人工客服'){if(event.replyToken)await lineReply(event.replyToken,'目前家長測試暫未開放「⑤ 人工客服」。本次測試請先使用① LINE綁定、④ AI客服、⑥ 圖片製作。');return;}
 
       const interaction=findInteraction(s,uid),b=findBinding(s,uid),status=b?.status||'UNBOUND';
       if(awake(s,uid)&&interaction?.mode==='綁定模式'){

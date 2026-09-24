@@ -51,3 +51,6 @@ V2.8.8 AI 客服大篩查後部署重點
 V2.8.8 測試注意：可直接用英文測試 `what's the weather in Taipei`；此類問題現在應進入 Gemini Google Search grounding。若仍回覆「沒有即時資訊」，請查看 Render Log 的 `AI route plan`，其中 `useSearch` 應為 `true`。
 
 V2.8.9: 新增 ai-route.js 與路由自測；Render 啟動時應看到 AI route self-test PASS。
+
+
+V2.9.3 家長測試：選單標示目前開放① LINE綁定、④ AI客服、⑥ 圖片製作；② 課程查詢、③ 繳費／收據、⑤ 人工客服在本次測試中以未開放提示回覆。
