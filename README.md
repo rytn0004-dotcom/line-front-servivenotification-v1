@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.9.3
+# LINE 客服系統 V2.9.4
 
 本版重點：AI 客服「路由防誤擋＋真正失敗降級」。
 
@@ -29,3 +29,14 @@
 - 本次家長測試建議先使用 ① LINE綁定、④ AI客服、⑥ 圖片製作。
 - AI 每人每日基本額度仍由「系統設定」的「每人每日基本額度」控制；目前正式測試設定應為 5。
 - 本版沒有修改 Excel，也沒有把 Excel 放入 ZIP。
+
+
+## V2.9.4 AI 真正故障診斷與 Cloudflare 備援修正
+1. Gemini model/project cooldown 不再靜默跳過；Render Log 會記錄 SKIPPED、原因與剩餘冷卻時間。
+2. `AI_ALL_PROVIDERS_FAILED summary` 新增 skipped、Cloudflare transport/response diagnostics，方便定位真正故障點。
+3. Cloudflare 文字回覆解析擴充：Native REST 與 OpenAI-compatible 支援多種 content 結構，不再只抓單一路徑。
+4. Cloudflare HTTP error、invalid JSON、empty response、timeout 會分別記錄，且不記錄 API Token 或完整使用者 Prompt。
+5. Cloudflare 某個模型／transport 出現 403/404/429 等可繼續嘗試其他模型／transport，不會過早中止整個 fallback。
+6. 不新增額外 Cloudflare 付費／配額消耗型啟動測試；啟動 preflight 仍只做授權檢查。
+7. 保留 V2.9.3 家長測試選單：① LINE綁定、④ AI客服、⑥ 圖片製作。
+8. 不包含 Excel。

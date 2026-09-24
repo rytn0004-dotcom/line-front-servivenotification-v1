@@ -54,3 +54,10 @@ V2.8.9: 新增 ai-route.js 與路由自測；Render 啟動時應看到 AI route 
 
 
 V2.9.3 家長測試：選單標示目前開放① LINE綁定、④ AI客服、⑥ 圖片製作；② 課程查詢、③ 繳費／收據、⑤ 人工客服在本次測試中以未開放提示回覆。
+
+
+V2.9.4 AI 診斷重點
+1. Gemini 若因 project/model cooldown 被略過，Render Log 會顯示 `AI Gemini project skipped` 或 skipped 陣列。
+2. Cloudflare 若回 HTTP 200 但沒有文字，會顯示 `Cloudflare text empty diagnostic`，只記錄 response 結構摘要，不記錄 Token／完整 Prompt。
+3. 最終失敗摘要會同時包含 attempts、skipped、cloudflareAttempts。
+4. 不需要新增 Render Environment 變數；沿用 V2.9.3 設定即可。

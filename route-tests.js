@@ -25,5 +25,5 @@ const courseCases=[['我小孩星期六幾點上課？',true],['下一堂課幾�
 for(const [t,e] of courseCases)assert.strictEqual(looksLikeCourseQuestion(t),e,`course: ${t}`);
 const mediaCases=[['幫我看這張圖片',true],['請分析這份 PDF',true],['PDF 是什麼？',false],['文件格式有哪些？',false],['請解釋這個概念',false]];
 for(const [t,e] of mediaCases)assert.strictEqual(looksLikeMediaInstruction(t),e,`media: ${t}`);
-console.log('V2.8.9 route guard tests: PASS');
+console.log('V2.9.4 route guard regression tests: PASS');
 console.log(JSON.stringify({routeCases:routeCases.length,probeCases:probeCases.length,courseCases:courseCases.length,mediaCases:mediaCases.length},null,2));
