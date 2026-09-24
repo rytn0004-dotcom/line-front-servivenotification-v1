@@ -1,6 +1,6 @@
 {
   "name": "line-frontend-customer-service-v2.8",
-  "version": "2.8.7",
+  "version": "2.8.9",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
