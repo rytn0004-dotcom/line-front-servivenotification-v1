@@ -28,6 +28,7 @@ function needsFreshWeb(text){
   return enFresh.some(re=>re.test(t));
 }
 
+// Route classification is a signal only. It must never be used as a hard denial by itself.
 function classifyAIRoute(text){
   const t=clean(text);
   if(!t)return {route:'general',useSearch:false,confidence:'none',reason:'empty'};
