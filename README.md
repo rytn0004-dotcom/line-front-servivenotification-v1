@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.8.7｜AI 客服全面修正版＋免費圖片製作
+# LINE 客服系統 V2.8.8｜AI 客服全面修正版＋免費圖片製作
 
 本版以 V2.7.1 為基礎，新增「⑥ 圖片製作」，圖片生成不使用 Gemini 生圖模型，也不啟用任何付費 Gemini 圖片 API。
 
@@ -113,7 +113,7 @@ V2.8.5 啟動時會用 Cloudflare 的 Model Search API 做「不消耗圖片生�
 Gemma 4 26B A4B 目前仍列於 Workers AI 可用模型；Cloudflare 官方文件提供 REST `/ai/run` 的 `messages` 用法。Cloudflare 於 2026-09-17 新增 `rejectIfBusy`，可避免同步推論在容量不足時等待佇列。
 
 
-## V2.8.7 全面修正與大篩查
+## V2.8.8 全面修正與大篩查
 
 本版針對 AI 客服無法使用、普通文字被誤導到課程查詢，以及請求延遲等問題做程式層級的全面檢查與修正。
 
@@ -135,3 +135,18 @@ Gemma 4 26B A4B 目前仍列於 Workers AI 可用模型；Cloudflare 官方文�
 已完成 Node syntax check、靜態規則檢查，以及 mock provider integration tests，涵蓋正常 Gemini 成功、Gemini 429 後 Cloudflare 備援、Cloudflare 第一模型失敗後第二模型接手、即時搜尋不誤送到非搜尋模型、額度批次寫入、OpenAI 相容通道 timeout 與路由誤判回歸測試。
 
 注意：本次測試未使用你的 Render／Gemini／Cloudflare 真實密鑰對外部 API 做實際請求；部署後仍需以 Render Log 的 preflight 與一次 LINE 真實訊息做 live smoke test。
+
+## V2.8.8 本次追加修正：英文即時問題與客服語言
+- 修正英文即時問題未進入 Google Search grounding 的路由問題，例如 `what's the weather`、`what's the weather in Taipei`、`latest news`。
+- 保留中文即時資訊判斷，避免「老師今天辛苦了」這類一般對話誤觸發搜尋。
+- 英文詢問今天日期／星期／時間可由後端以台灣時間直接回答。
+- AI 系統提示加強：除非使用者明確要求其他語言，否則一律使用繁體中文。
+- 回答「你是誰／你是什麼」時不得洩漏 Google、Gemini、Cloudflare、模型名稱、供應商或其他內部技術資訊。
+
+## V2.8.8 測試重點
+- `what's the weather` → 進即時搜尋路由
+- `what's the weather in Taipei` → 進即時搜尋路由
+- `how's the weather like` → 進即時搜尋路由
+- `latest news` → 進即時搜尋路由
+- `老師今天辛苦了` → 不進即時搜尋
+- `今天台灣天氣` → 進即時搜尋
