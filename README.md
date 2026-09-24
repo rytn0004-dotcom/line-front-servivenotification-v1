@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.8.5｜免費圖片製作＋Gemini 多模型額度自動切換
+# LINE 客服系統 V2.8.7｜AI 客服全面修正版＋免費圖片製作
 
 本版以 V2.7.1 為基礎，新增「⑥ 圖片製作」，圖片生成不使用 Gemini 生圖模型，也不啟用任何付費 Gemini 圖片 API。
 
@@ -111,3 +111,27 @@ V2.8.5 啟動時會用 Cloudflare 的 Model Search API 做「不消耗圖片生�
 `ENABLE_CLOUDFLARE_TEXT_FALLBACK=true`
 
 Gemma 4 26B A4B 目前仍列於 Workers AI 可用模型；Cloudflare 官方文件提供 REST `/ai/run` 的 `messages` 用法。Cloudflare 於 2026-09-17 新增 `rejectIfBusy`，可避免同步推論在容量不足時等待佇列。
+
+
+## V2.8.7 全面修正與大篩查
+
+本版針對 AI 客服無法使用、普通文字被誤導到課程查詢，以及請求延遲等問題做程式層級的全面檢查與修正。
+
+### 主要修正
+- 「可以」「假日」等一般 2～6 字中文不再自動判定為學生／老師姓名。只有與目前使用者已綁定的姓名完全相符，才會進入姓名相關保護流程。
+- 課程問題判斷收斂為明確的課程／上課／課表語境，不再因單獨出現「老師」就攔截一般 AI 問題。
+- 媒體指令改為必須有明確圖片／文件／附件等語境，避免「請解釋這個概念」「分析市場」等普通文字被要求上傳媒體。
+- `aiSettingNum` 遇到空白設定時會使用程式預設值，不會把空白錯誤轉成數字 0。
+- AI 額度管理的 O:R 欄位初始化改為整批處理；一般 AI 請求不再每次重新逐列掃描並寫入整張媒體欄位。
+- AI 額度寫入改為 Google Sheets `batchUpdate`；正常文字請求的額度寫入由多次逐格更新縮減為單次批次更新。
+- G/H 公式不再被一般額度使用流程覆蓋；正常使用不寫入 H 欄，G/H 只在新建資料列時建立公式。
+- Cloudflare 文字備援與 OpenRouter/Groq 備援保存對話歷史時，會同時保存本次使用者訊息與 AI 回覆，避免備援通道下的上下文斷裂。
+- OpenAI 相容通道加入 AbortController timeout，避免外部通道卡住整體請求。
+- 僅設定 Cloudflare Workers AI 時，④ AI客服仍視為已配置 AI 通道。
+- Render 啟動時新增 Gemini A/B/C API preflight，並顯示實際缺少或無法存取的模型；同時保留 Cloudflare Workers AI auth preflight。
+- AI 請求紀錄會顯示路由計畫、額度保留耗時、實際成功通道與總耗時；錯誤紀錄不輸出 API Token。
+
+### 本版測試
+已完成 Node syntax check、靜態規則檢查，以及 mock provider integration tests，涵蓋正常 Gemini 成功、Gemini 429 後 Cloudflare 備援、Cloudflare 第一模型失敗後第二模型接手、即時搜尋不誤送到非搜尋模型、額度批次寫入、OpenAI 相容通道 timeout 與路由誤判回歸測試。
+
+注意：本次測試未使用你的 Render／Gemini／Cloudflare 真實密鑰對外部 API 做實際請求；部署後仍需以 Render Log 的 preflight 與一次 LINE 真實訊息做 live smoke test。

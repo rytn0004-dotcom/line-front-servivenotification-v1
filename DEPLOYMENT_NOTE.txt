@@ -34,3 +34,15 @@ V2.8.5：模型路由會自動補齊 Gemini 備援；建議 GEMINI_REQUEST_TIMEO
 
 
 V2.8.6：一般 AI 客服 Cloudflare 文字備援改為 Gemma 4 26B A4B → GLM-4.7-Flash；預設啟用 rejectIfBusy，避免容量佇列造成無效等待。圖片通道維持原設定。
+
+
+V2.8.7 AI 客服大篩查後部署重點
+
+1. Render Service 建議保持目前實際服務名稱／網址：line-bulk-notification-v1。render.yaml 已同步。
+2. CLOUDFLARE_API_TOKEN 只能填「純 Token」，不要把 curl、URL、-H 或 Authorization 一起貼進去。
+3. PUBLIC_BASE_URL 填目前這個 Render Service 的 HTTPS 公開網址。
+4. V2.8.7 啟動時會做 Gemini A/B/C 與 Cloudflare Workers AI 的 preflight；請在 Render Log 尋找：
+   - Gemini API preflight OK / FAILED
+   - Cloudflare Workers AI auth preflight OK / FAILED
+5. 一般 AI 客服已修正：錯誤的姓名／課程／媒體指令誤判、AI 額度表每次請求大量寫入、H 欄公式被暫時覆蓋、Cloudflare fallback 對話歷史不完整、OpenAI 相容通道無 timeout 等問題。
+6. 本版沒有把 Excel 放入程式 ZIP。
