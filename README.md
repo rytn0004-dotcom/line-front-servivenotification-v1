@@ -54,3 +54,12 @@
 6. Render Log 的 AI_ALL_PROVIDERS_FAILED summary 增加 attempt/skip/cloudflare 數量，便於診斷。
 
 本版不新增啟動時實際 AI 推理測試，不會因部署而額外消耗 Gemini 或 Cloudflare 推理配額。
+
+
+## V2.9.6 Provider cooldown policy
+- Gemini cooldown is **model-only**. A failure on gemini-3.8-flash cannot suppress gemini-3.1-flash-lite in the same Project.
+- Gemini 503 gets a short model cooldown (default 20s).
+- Gemini 429 quota/rate-limit is applied to the specific model only (default 5min), while other models in the same Project remain eligible.
+- Gemini 401/403 is also isolated to the specific model; other models remain testable.
+- Project-wide cooldown state has been removed from the active server.
+- This prevents a single model failure from taking an otherwise healthy Project out of the rotation.

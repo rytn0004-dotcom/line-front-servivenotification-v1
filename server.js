@@ -24,8 +24,7 @@ const GEMINI_MODEL=GEMINI_MODEL_ORDER[0]||'gemini-3.8-flash';
 const GEMINI_THINKING_LEVEL=String(process.env.GEMINI_THINKING_LEVEL||'low').trim().toLowerCase();
 const GEMINI_MODEL_COOLDOWN_MS=Math.max(10000,Number(process.env.GEMINI_MODEL_COOLDOWN_MS||30000));
 const GEMINI_MODEL_LONG_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_LONG_COOLDOWN_MS||600000));
-const GEMINI_MODEL_QUOTA_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_MODEL_QUOTA_COOLDOWN_MS||21600000));
-const GEMINI_PROJECT_QUOTA_COOLDOWN_MS=Math.max(60000,Number(process.env.GEMINI_PROJECT_QUOTA_COOLDOWN_MS||21600000));
+const GEMINI_MODEL_QUOTA_COOLDOWN_MS=Math.max(30000,Number(process.env.GEMINI_MODEL_QUOTA_COOLDOWN_MS||300000));
 const GEMINI_503_COOLDOWN_MS=Math.max(5000,Number(process.env.GEMINI_503_COOLDOWN_MS||20000));
 // 單一 Gemini 模型最長等待 90 秒；整體等待仍由系統設定的「AI 一般最長等待秒數」控制。
 // Cloudflare 文字備援另外採用「容量忙碌立即拒絕」策略，避免把時間卡在容量佇列。
@@ -101,7 +100,7 @@ app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
 const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
 const logBuffer=[];let logTimer=null;
-const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map(),projectCooldowns:new Map(),imageGenFlows:new Map(),imageGenCountGlobal:0,imageGenCountUsers:new Map()};
+const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map(),imageGenFlows:new Map(),imageGenCountGlobal:0,imageGenCountUsers:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
 const mediaSemaphore={active:0,queue:[]};
 async function withAIQuotaLock(fn){const prev=aiQuotaLock.tail;let release;aiQuotaLock.tail=new Promise(r=>release=r);await prev;try{return await fn();}finally{release();}}
@@ -907,20 +906,6 @@ function setModelCooldown(projectId,model,status,retryAfterMs=0,isQuotaExceeded=
   return duration;
 }
 function clearModelCooldown(projectId,model){ai.modelCooldowns.delete(cooldownKey(projectId,model));}
-function projectIsCooling(projectId){return Number(ai.projectCooldowns.get(projectId)||0)>Date.now();}
-function setProjectCooldown(projectId,status,retryAfterMs=0){
-  const code=Number(status||0);
-  let duration=GEMINI_MODEL_COOLDOWN_MS;
-  if([401,403].includes(code))duration=GEMINI_MODEL_LONG_COOLDOWN_MS;
-  if(code===429&&retryAfterMs>0)duration=Math.min(Math.max(retryAfterMs,GEMINI_MODEL_COOLDOWN_MS),GEMINI_MODEL_LONG_COOLDOWN_MS);
-  ai.projectCooldowns.set(projectId,Date.now()+duration);
-}
-function clearProjectCooldown(projectId){ai.projectCooldowns.delete(projectId);}
-function setGeminiProjectQuotaCooldown(projectId,retryAfterMs=0){
-  const duration=Math.min(Math.max(Number(retryAfterMs||0),GEMINI_PROJECT_QUOTA_COOLDOWN_MS),GEMINI_PROJECT_QUOTA_COOLDOWN_MS);
-  ai.projectCooldowns.set(projectId,Date.now()+duration);
-  return duration;
-}
 function geminiModelOrder(projectId){return GEMINI_MODEL_ORDER.filter(m=>!modelIsCooling(projectId,m));}
 function isGeminiModelErrorMessage(msg){return /^Gemini\s+\d{3}\b/i.test(String(msg||''));}
 function historyToMessages(uid){
@@ -1148,7 +1133,7 @@ async function aiGenerate(uid,text,context,opts={}){
   const allowExternalBase=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
   const externalProviders=(allowExternalBase && (!useSearch || allowFreshDegraded))?configuredProviders().filter(name=>name!=='gemini'):[];
   const cloudflareTextReady=ENABLE_CLOUDFLARE_TEXT_FALLBACK&&!hasMedia&&!privateContext&&(!useSearch||allowFreshDegraded)&&!!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN);
-  console.log('AI route plan',{uid,route:route.route,routeConfidence:route.confidence,routeReason:route.reason,useSearch,allowFreshDegraded,privateContext,hasMedia,geminiProjects:geminiProjects().map(x=>x.id),cloudflareTextReady,externalProviders,routeFailOpen:AI_ROUTE_FAIL_OPEN,cloudflareOpenAITransport:AI_CLOUDFLARE_OPENAI_FALLBACK,quotaReserveMs:Date.now()-quotaStartedAt});
+  console.log('AI route plan',{uid,route:route.route,routeConfidence:route.confidence,routeReason:route.reason,useSearch,allowFreshDegraded,privateContext,hasMedia,geminiProjects:geminiProjects().map(x=>x.id),cooldownScope:'model-only',cloudflareTextReady,externalProviders,routeFailOpen:AI_ROUTE_FAIL_OPEN,cloudflareOpenAITransport:AI_CLOUDFLARE_OPENAI_FALLBACK,quotaReserveMs:Date.now()-quotaStartedAt});
   if(geminiProjects().length===0&&externalProviders.length===0&&!cloudflareTextReady){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
   let lastErr=null;
   const attempts=[];
@@ -1157,13 +1142,6 @@ async function aiGenerate(uid,text,context,opts={}){
   const geminiProjectsList=geminiProjects();
   if(geminiProjectsList.length){
     outer: for(const project of geminiProjectsList){
-      const projectCooldownUntil=Number(ai.projectCooldowns.get(project.id)||0);
-      if(projectCooldownUntil>Date.now()){
-        const item={scope:'project',project:project.id,reason:'cooldown',remainingMs:projectCooldownUntil-Date.now()};
-        skipped.push(item);
-        console.warn('AI Gemini project skipped',{project:project.id,reason:item.reason,remainingMs:item.remainingMs});
-        continue;
-      }
       const projectModels=GEMINI_MODEL_ORDER;
       for(const model of projectModels){
         const modelCooldownUntil=Number(ai.modelCooldowns.get(cooldownKey(project.id,model))||0);
@@ -1186,18 +1164,16 @@ async function aiGenerate(uid,text,context,opts={}){
           lastErr=e;const code=errorCode(e);
           if(code===429){
             if(e.isQuotaExceeded){
-              const projectDuration=setGeminiProjectQuotaCooldown(project.id,e.retryAfterMs||0);
-              skipped.push({scope:'project',project:project.id,reason:'quota-exceeded',remainingMs:projectDuration});
-              console.warn('AI Gemini project quota exceeded; skipping remaining models in project',{project:project.id,model,remainingMs:projectDuration});
-              console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
-              break;
+              const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,true);
+              const item={scope:'model',project:project.id,model,reason:'quota-exceeded',remainingMs:duration};
+              skipped.push(item);
+              console.warn('AI Gemini model quota exceeded; keeping other models/project available',{project:project.id,model,remainingMs:duration});
             }
             const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,false);
             console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:false,retryAfterMs:e.retryAfterMs||0,cooldownMs:duration,next:'next-model'});
           }else if([401,403].includes(code)){
-            setProjectCooldown(project.id,code,e.retryAfterMs||0);
-            console.error('AI Gemini project authentication/permission failed',{project:project.id,model,code});
-            break;
+            const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0);
+            console.error('AI Gemini model authentication/permission failed; other models remain eligible',{project:project.id,model,code,cooldownMs:duration});
           }else if([404,408,409,500,502,503,504].includes(code)){
             const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0);
             console.warn('AI Gemini transient failure; model cooldown applied',{project:project.id,model,code,cooldownMs:duration});
@@ -1214,11 +1190,6 @@ async function aiGenerate(uid,text,context,opts={}){
     console.warn('AI fresh-search failed; retrying Gemini without search before fallback',{uid,attemptsBeforeRetry:beforeRetry});
     const retryProjects=geminiProjectsList;
     outerRetry: for(const project of retryProjects){
-      const projectCooldownUntil=Number(ai.projectCooldowns.get(project.id)||0);
-      if(projectCooldownUntil>Date.now()){
-        skipped.push({scope:'project',project:project.id,reason:'cooldown-degraded-search',remainingMs:projectCooldownUntil-Date.now()});
-        continue;
-      }
       const projectModels=GEMINI_MODEL_ORDER;
       for(const model of projectModels){
         const modelCooldownUntil=Number(ai.modelCooldowns.get(cooldownKey(project.id,model))||0);
@@ -1241,13 +1212,12 @@ async function aiGenerate(uid,text,context,opts={}){
           const code=errorCode(e);
           if(code===429){
             if(e.isQuotaExceeded){
-              const projectDuration=setGeminiProjectQuotaCooldown(project.id,e.retryAfterMs||0);
-              skipped.push({scope:'project',project:project.id,reason:'quota-exceeded-degraded-search',remainingMs:projectDuration});
-              console.warn('AI Gemini degraded retry hit project quota; skipping project',{project:project.id,model,remainingMs:projectDuration});
-              break;
+              const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,true);
+              skipped.push({scope:'model',project:project.id,model,reason:'quota-exceeded-degraded-search',remainingMs:duration});
+              console.warn('AI Gemini degraded retry hit model quota; keeping project available',{project:project.id,model,remainingMs:duration});
             }
             setModelCooldown(project.id,model,code,e.retryAfterMs||0,false);
-          }else if([401,403].includes(code)){setProjectCooldown(project.id,code,e.retryAfterMs||0);break;}
+          }else if([401,403].includes(code)){setModelCooldown(project.id,model,code,e.retryAfterMs||0);}
           else if([404,408,409,500,502,503,504].includes(code))setModelCooldown(project.id,model,code,e.retryAfterMs||0);
           console.error('AI Gemini degraded retry failed',{project:project.id,model,code,message:e.message});
         }

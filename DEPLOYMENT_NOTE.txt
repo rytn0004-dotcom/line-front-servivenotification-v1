@@ -69,3 +69,11 @@ V2.9.5 deployment note
 - Optional new defaults are already in .env.example; they can be left at defaults.
 - Do not add the Excel workbook to this ZIP.
 - After deploy, test one simple AI question first; then inspect Render Logs for `AI success` and provider/transport.
+
+
+V2.9.6 cooldown migration
+- Active Gemini cooldown is model-only. There is no active Project-wide cooldown in server.js.
+- GEMINI_MODEL_QUOTA_COOLDOWN_MS defaults to 300000 (5 minutes) for a quota-exceeded model.
+- GEMINI_503_COOLDOWN_MS defaults to 20000 (20 seconds).
+- The old GEMINI_PROJECT_QUOTA_COOLDOWN_MS setting is no longer read by the active server and can be removed from Render Environment.
+- Do not add more Gemini keys just to compensate for this issue; test A/B/C again after deployment.

@@ -1,3 +1,10 @@
+const fs = require('fs');
+const source = fs.readFileSync(require.resolve('./server.js'),'utf8');
+if (/projectCooldowns|setGeminiProjectQuotaCooldown|GEMINI_PROJECT_QUOTA_COOLDOWN_MS/.test(source)) {
+  throw new Error('Project-wide Gemini cooldown logic still exists in server.js');
+}
+if (!source.includes("cooldownScope:'model-only'")) throw new Error('Model-only cooldown diagnostic missing');
+console.log('V2.9.6 project-wide cooldown regression: PASS');
 const assert = require('assert');
 
 function textFromContent(value){
