@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.9.4
+# LINE 客服系統 V2.9.7
 
 本版重點：AI 客服「路由防誤擋＋真正失敗降級」。
 
@@ -63,3 +63,20 @@
 - Gemini 401/403 is also isolated to the specific model; other models remain testable.
 - Project-wide cooldown state has been removed from the active server.
 - This prevents a single model failure from taking an otherwise healthy Project out of the rotation.
+
+
+## V2.9.7 Gemini Project mapping / cooldown hotfix
+1. Gemini A/B/C now expose the actual configured Google Cloud Project IDs in Render diagnostics (Project ID only; no API key is logged).
+2. Confirmed mapping used by this release: A=`gen-lang-client-0348350940`, B=`gen-lang-client-0609456009`, C=`gen-lang-client-0705859251`; Render environment variables `GEMINI_PROJECT_ID_A/B/C` can override these values.
+3. Removed the stale `clearProjectCooldown(...)` call that remained after the model-only cooldown migration and could throw `clearProjectCooldown is not defined`.
+4. Gemini cooldown remains model-only: one model's 429/503 does not suppress other models in the same Project.
+5. AI route diagnostics now show `slot`, `projectId`, `cooldownScope=model-only`, and `projectCooldownDisabled=true`.
+
+### Expected startup diagnostics
+```text
+Gemini API preflight OK { project: 'A', projectId: 'gen-lang-client-0348350940', ... }
+Gemini API preflight OK { project: 'B', projectId: 'gen-lang-client-0609456009', ... }
+Gemini API preflight OK { project: 'C', projectId: 'gen-lang-client-0705859251', ... }
+```
+
+The Project IDs are diagnostic identifiers, not secrets. API keys are never logged.

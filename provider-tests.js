@@ -1,10 +1,12 @@
 const fs = require('fs');
 const source = fs.readFileSync(require.resolve('./server.js'),'utf8');
-if (/projectCooldowns|setGeminiProjectQuotaCooldown|GEMINI_PROJECT_QUOTA_COOLDOWN_MS/.test(source)) {
+if (/projectCooldowns|setGeminiProjectQuotaCooldown|GEMINI_PROJECT_QUOTA_COOLDOWN_MS|clearProjectCooldown/.test(source)) {
   throw new Error('Project-wide Gemini cooldown logic still exists in server.js');
 }
 if (!source.includes("cooldownScope:'model-only'")) throw new Error('Model-only cooldown diagnostic missing');
-console.log('V2.9.6 project-wide cooldown regression: PASS');
+for (const id of ['gen-lang-client-0348350940','gen-lang-client-0609456009','gen-lang-client-0705859251']) { if (!source.includes(id)) throw new Error(`Configured Gemini Project ID missing: ${id}`); }
+if (!source.includes('projectCooldownDisabled:true')) throw new Error('Project-wide cooldown disable diagnostic missing');
+console.log('V2.9.7 model-only cooldown + Project mapping regression: PASS');
 const assert = require('assert');
 
 function textFromContent(value){

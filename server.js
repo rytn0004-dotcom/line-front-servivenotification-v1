@@ -16,6 +16,11 @@ const LINE_TOKEN=process.env.LINE_CHANNEL_ACCESS_TOKEN||'';
 const GEMINI_API_KEY=String(process.env.GEMINI_API_KEY||'').trim();
 const GEMINI_API_KEY_B=String(process.env.GEMINI_API_KEY_B||'').trim();
 const GEMINI_API_KEY_C=String(process.env.GEMINI_API_KEY_C||'').trim();
+// Gemini Project IDs are diagnostic metadata only; they never contain API keys.
+// Defaults match the three Project IDs confirmed by the user; Render env vars may override them.
+const GEMINI_PROJECT_ID_A=String(process.env.GEMINI_PROJECT_ID_A||'gen-lang-client-0348350940').trim();
+const GEMINI_PROJECT_ID_B=String(process.env.GEMINI_PROJECT_ID_B||'gen-lang-client-0609456009').trim();
+const GEMINI_PROJECT_ID_C=String(process.env.GEMINI_PROJECT_ID_C||'gen-lang-client-0705859251').trim();
 const GEMINI_FALLBACK_MODELS=['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-3.1-flash-lite'];
 const GEMINI_CONFIGURED_MODELS=String(process.env.GEMINI_MODEL_ORDER||'').split(',').map(x=>x.trim()).filter(Boolean);
 // 即使 Render 只填單一模型，也自動補齊可用備援模型。
@@ -369,17 +374,17 @@ async function geminiAuthPreflight(){
       const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key=${encodeURIComponent(project.key)}`,{headers:{Accept:'application/json'},signal:controller.signal});
       const raw=await r.text();
       if(!r.ok){
-        console.error('Gemini API preflight FAILED',{project:project.id,status:r.status,message:raw.slice(0,300)});
+        console.error('Gemini API preflight FAILED',{project:project.id,projectId:project.projectId||'not-set',status:r.status,message:raw.slice(0,300)});
         results.push({project:project.id,ok:false,status:r.status});
         continue;
       }
-      let data;try{data=JSON.parse(raw);}catch{console.error('Gemini API preflight FAILED',{project:project.id,status:502,message:'invalid JSON'});results.push({project:project.id,ok:false,status:502});continue;}
+      let data;try{data=JSON.parse(raw);}catch{console.error('Gemini API preflight FAILED',{project:project.id,projectId:project.projectId||'not-set',status:502,message:'invalid JSON'});results.push({project:project.id,ok:false,status:502});continue;}
       const available=new Set((data?.models||[]).map(m=>String(m?.name||'').replace(/^models\//,'')));
       const missing=GEMINI_MODEL_ORDER.filter(m=>!available.has(m));
-      console.log('Gemini API preflight OK',{project:project.id,modelCount:available.size,missingConfiguredModels:missing});
+      console.log('Gemini API preflight OK',{project:project.id,projectId:project.projectId||'not-set',projectIdSource:process.env[`GEMINI_PROJECT_ID_${project.id}`]?'env':'default',modelCount:available.size,missingConfiguredModels:missing});
       results.push({project:project.id,ok:true,status:r.status,modelCount:available.size,missing});
     }catch(e){
-      console.error('Gemini API preflight ERROR',{project:project.id,message:e?.name==='AbortError'?'timeout':e?.message||'unknown'});
+      console.error('Gemini API preflight ERROR',{project:project.id,projectId:project.projectId||'not-set',message:e?.name==='AbortError'?'timeout':e?.message||'unknown'});
       results.push({project:project.id,ok:false,status:0});
     }finally{clearTimeout(timer);}
   }
@@ -879,9 +884,9 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
 
 function geminiProjects(){
   return [
-    {id:'A',key:GEMINI_API_KEY},
-    {id:'B',key:GEMINI_API_KEY_B},
-    {id:'C',key:GEMINI_API_KEY_C}
+    {id:'A',key:GEMINI_API_KEY,projectId:GEMINI_PROJECT_ID_A},
+    {id:'B',key:GEMINI_API_KEY_B,projectId:GEMINI_PROJECT_ID_B},
+    {id:'C',key:GEMINI_API_KEY_C,projectId:GEMINI_PROJECT_ID_C}
   ].filter(x=>x.key&&GEMINI_MODEL_ORDER.length);
 }
 function providerReady(name){
@@ -1058,7 +1063,7 @@ async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTo
   const candidate=data?.candidates?.[0]||{};
   const answer=String(candidate?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();
   if(!answer){const e=new Error(`Gemini empty [${projectId}/${model}]`);e.code=502;e.model=model;e.projectId=projectId;throw e;}
-  clearModelCooldown(projectId,model);clearProjectCooldown(projectId);
+  clearModelCooldown(projectId,model);
   return {answer,finishReason:String(candidate?.finishReason||''),usageMetadata:data?.usageMetadata||null};
 }
 function errorCode(err){return Number(err?.code||String(err?.message||'').match(/\b(4\d\d|5\d\d)\b/)?.[1]||0);}
@@ -1133,7 +1138,7 @@ async function aiGenerate(uid,text,context,opts={}){
   const allowExternalBase=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
   const externalProviders=(allowExternalBase && (!useSearch || allowFreshDegraded))?configuredProviders().filter(name=>name!=='gemini'):[];
   const cloudflareTextReady=ENABLE_CLOUDFLARE_TEXT_FALLBACK&&!hasMedia&&!privateContext&&(!useSearch||allowFreshDegraded)&&!!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN);
-  console.log('AI route plan',{uid,route:route.route,routeConfidence:route.confidence,routeReason:route.reason,useSearch,allowFreshDegraded,privateContext,hasMedia,geminiProjects:geminiProjects().map(x=>x.id),cooldownScope:'model-only',cloudflareTextReady,externalProviders,routeFailOpen:AI_ROUTE_FAIL_OPEN,cloudflareOpenAITransport:AI_CLOUDFLARE_OPENAI_FALLBACK,quotaReserveMs:Date.now()-quotaStartedAt});
+  console.log('AI route plan',{uid,route:route.route,routeConfidence:route.confidence,routeReason:route.reason,useSearch,allowFreshDegraded,privateContext,hasMedia,geminiProjects:geminiProjects().map(x=>({slot:x.id,projectId:x.projectId||'not-set'})),cooldownScope:'model-only',projectCooldownDisabled:true,cloudflareTextReady,externalProviders,routeFailOpen:AI_ROUTE_FAIL_OPEN,cloudflareOpenAITransport:AI_CLOUDFLARE_OPENAI_FALLBACK,quotaReserveMs:Date.now()-quotaStartedAt});
   if(geminiProjects().length===0&&externalProviders.length===0&&!cloudflareTextReady){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
   let lastErr=null;
   const attempts=[];
