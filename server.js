@@ -107,7 +107,7 @@ const auth=new google.auth.GoogleAuth({credentials:creds,scopes:['https://www.go
 const sheets=google.sheets({version:'v4',auth});
 app.use(express.json({verify:(req,_res,buf)=>{req.rawBody=buf;}}));
 
-const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map()};
+const cache={snapshot:null,expiresAt:0,inFlight:null,locks:new Map(),seenWebhookEvents:new Map(),replyTokensDelivered:new Map()};
 const logBuffer=[];let logTimer=null;
 const ai={day:'',total:0,users:new Map(),history:new Map(),lastUse:new Map(),mediaBytesGlobal:0,mediaBytesUsers:new Map(),pendingMediaText:new Map(),pendingMedia:new Map(),modelCooldowns:new Map(),imageGenFlows:new Map(),imageGenCountGlobal:0,imageGenCountUsers:new Map()};
 const aiQuotaLock={tail:Promise.resolve()};
@@ -1434,10 +1434,31 @@ async function handleDeferredMediaWithText(event,s,uid,lineName,settings,pending
   if(event.replyToken)await lineReplyQuick(event.replyToken,`已收到${label}與您的要求：\n\n「${formatForLine(instruction)}」\n\n送出前請確認。若按鈕沒有顯示，也可以直接輸入「確認送出」或「發送」。`,mediaConfirmQuickReply());
 }
 
+function markReplyTokenDelivered(token){
+  const key=String(token||'').trim();
+  if(!key)return;
+  const now=Date.now();
+  const ttl=10*60*1000;
+  for(const [k,ts] of cache.replyTokensDelivered){if(now-ts>ttl)cache.replyTokensDelivered.delete(k);}
+  cache.replyTokensDelivered.set(key,now);
+}
+function wasReplyTokenDelivered(token){
+  const key=String(token||'').trim();
+  if(!key)return false;
+  const ts=cache.replyTokensDelivered.get(key);
+  if(!ts)return false;
+  if(Date.now()-ts>10*60*1000){cache.replyTokensDelivered.delete(key);return false;}
+  return true;
+}
+function shouldSuppressSecondUserResponse(event){
+  return Boolean(event?.__lineResponseDelivered)||wasReplyTokenDelivered(event?.replyToken);
+}
+
 async function lineReplyPayload(token,messages){
   const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages})});
   const raw=r.ok?'':await r.text();
   if(!r.ok)throw new Error(`LINE reply ${r.status}: ${raw}`);
+  markReplyTokenDelivered(token);
   return {status:r.status};
 }
 async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
@@ -1455,17 +1476,17 @@ async function withLineLoading(uid,waitMs,fn){
 async function replyOrPush(event,uid,text,startedAt,traceId=''){
   const elapsed=Date.now()-startedAt;
   if(event?.replyToken&&elapsed<AI_REPLY_SAFE_WINDOW_MS){
-    try{const result=await lineReply(event.replyToken,text);console.log('LINE delivery success',{traceId,method:'reply',status:result.status,elapsedMs:Date.now()-startedAt});return 'reply';}
+    try{const result=await lineReply(event.replyToken,text);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'reply',status:result.status,elapsedMs:Date.now()-startedAt});return 'reply';}
     catch(e){console.error('LINE reply failed, fallback to push',{traceId,elapsedMs:Date.now()-startedAt,message:e.message});}
   }
-  try{const result=await linePush(uid,text);console.log('LINE delivery success',{traceId,method:'push',status:result.status,elapsedMs:Date.now()-startedAt});return 'push';}
+  try{const result=await linePush(uid,text);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'push',status:result.status,elapsedMs:Date.now()-startedAt});return 'push';}
   catch(e){console.error('LINE delivery failed',{traceId,method:'push',elapsedMs:Date.now()-startedAt,message:e.message});throw e;}
 }
 async function replyOrPushMessages(event,uid,messages,startedAt){
   if(event?.replyToken&&Date.now()-startedAt<AI_REPLY_SAFE_WINDOW_MS){
-    try{await lineReplyPayload(event.replyToken,messages);return;}catch(e){console.warn('LINE reply messages failed, fallback to push',e.message);}
+    try{await lineReplyPayload(event.replyToken,messages);event.__lineResponseDelivered=true;return;}catch(e){console.warn('LINE reply messages failed, fallback to push',e.message);}
   }
-  await linePushMessages(uid,messages);
+  await linePushMessages(uid,messages);event.__lineResponseDelivered=true;
 }
 
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
@@ -1499,7 +1520,7 @@ async function handleMediaPostback(event,s,uid,lineName,sm){
   }catch(e){
     console.error('media postback confirm',e.message);
     const msg=e.message==='AI_MEDIA_LIMIT'?`今日${kind==='image'?'圖片':'文件'}使用量已達上限，請稍後再試。`:e.message==='MEDIA_TOO_LARGE'?`${kind==='image'?'圖片':'文件'}超過系統限制，請壓縮後再傳送。`:e.message==='AI_LIMIT'?`本日 AI 額度不足；${kind==='image'?'圖片需使用 2 次':'文件需使用 3 次'}額度。`:e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片／文件目前無法處理，請稍後再試。';
-    try{await replyOrPush(event,uid,msg,startedAt);}catch(pushErr){console.error('media postback send failed',pushErr.message);}
+    if(!shouldSuppressSecondUserResponse(event)){try{await replyOrPush(event,uid,msg,startedAt);}catch(pushErr){console.error('media postback send failed',pushErr.message);}}
   }
   return true;
 }
@@ -1519,7 +1540,8 @@ async function processPendingMediaConfirmed(event,s,uid,lineName,settings,pendin
     const ans=await withLineLoading(uid,aiWaitMsFor(kind,settings),run);
     const finalText=ans.finishReason==='MAX_TOKENS'?`${ans.answer}\n\n（回答已接近系統長度上限，已盡量完整整理。）`:ans.answer;
     await replyOrPush(event,uid,finalText,startedAt);
-    await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));
+    try{await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));}
+    catch(bookErr){console.error('media post-delivery saveInteraction failed',{uid,message:bookErr.message});}
   });
 }
 
@@ -1541,9 +1563,20 @@ app.get('/generated-image/:token',async(req,res)=>{
 
 app.get('/health',(_req,res)=>res.json({ok:true}));
 
+function seenWebhookEvent(id){
+  const key=String(id||'').trim();
+  if(!key)return false;
+  const now=Date.now();
+  const ttl=15*60*1000;
+  for(const [k,ts] of cache.seenWebhookEvents){if(now-ts>ttl)cache.seenWebhookEvents.delete(k);}
+  if(cache.seenWebhookEvents.has(key))return true;
+  cache.seenWebhookEvents.set(key,now);
+  return false;
+}
+
 app.post('/webhook',async(req,res)=>{
   if(!sigOK(req))return res.status(401).send('Invalid signature');res.status(200).send('OK');
-  for(const event of req.body?.events||[]){const uid=event.source?.userId;if(!uid)continue;const queuedAt=Date.now();const eventTraceId=crypto.randomBytes(5).toString('hex');const prev=cache.locks.get(uid)||Promise.resolve();let release;const current=new Promise(r=>release=r);cache.locks.set(uid,current);
+  for(const event of req.body?.events||[]){const webhookEventId=String(event.webhookEventId||'').trim();if(webhookEventId&&seenWebhookEvent(webhookEventId)){console.warn('LINE duplicate webhook event skipped',{webhookEventId,type:event.type});continue;}const uid=event.source?.userId;if(!uid)continue;const queuedAt=Date.now();const eventTraceId=crypto.randomBytes(5).toString('hex');const prev=cache.locks.get(uid)||Promise.resolve();let release;const current=new Promise(r=>release=r);cache.locks.set(uid,current);
     prev.then(async()=>{
       console.log('LINE event begin',{traceId:eventTraceId,uid,type:event.type,messageType:event.message?.type||'',textLength:String(event.message?.text||'').length,queueWaitMs:Date.now()-queuedAt});
       const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
@@ -1653,13 +1686,14 @@ app.post('/webhook',async(req,res)=>{
             await replyOrPush(event,uid,ans,startedAt);await saveInteraction(s,uid,'AI課程查詢模式',taipei(Number(courseSettings['AI 對話閒置分鐘數']||25)*60000));
           }catch(aiErr){
             console.error('course gemini',aiErr.message);
-            if(event.replyToken)await lineReply(event.replyToken,`AI 文字整理目前暫時無法使用。為避免猜測，以下提供後端查到的授權課表資料：\n\n${exact}`);
+            if(!shouldSuppressSecondUserResponse(event)&&event.replyToken)await lineReply(event.replyToken,`AI 文字整理目前暫時無法使用。為避免猜測，以下提供後端查到的授權課表資料：\n\n${exact}`);
           }
         }catch(e){console.error('course ai',e.message);if(event.replyToken)await lineReply(event.replyToken,e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:'課程查詢目前暫時無法完成，請稍後再試。');}return;
       }
 
       if(awake(s,uid)&&interaction?.mode==='AI客服模式'){
         const aiStartedAt=Date.now();
+        let aiResponseDelivered=false;
         try{
           const c=contactByUid(s,uid);const aiSettings=settingsMap(s);
           const pending=takePendingMedia(uid);
@@ -1681,7 +1715,7 @@ app.post('/webhook',async(req,res)=>{
                 }catch(e){
                   console.error('media text confirm',e.message);
                   const msg=e.message==='AI_MEDIA_LIMIT'?`今日${kind==='image'?'圖片':'文件'}使用量已達上限，請稍後再試。`:e.message==='MEDIA_TOO_LARGE'?`${kind==='image'?'圖片':'文件'}超過系統限制，請壓縮後再傳送。`:e.message==='AI_LIMIT'?`本日 AI 額度不足；${kind==='image'?'圖片需使用 2 次':'文件需使用 3 次'}額度。`:e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再傳送。`:'圖片／文件目前無法處理，請稍後再試。';
-                  try{await replyOrPush(event,uid,msg,startedAt);}catch(sendErr){console.error('media text confirm send failed',sendErr.message);}
+                  if(!shouldSuppressSecondUserResponse(event)){try{await replyOrPush(event,uid,msg,startedAt);}catch(sendErr){console.error('media text confirm send failed',sendErr.message);}}
                 }
                 return;
               }
@@ -1712,8 +1746,12 @@ app.post('/webhook',async(req,res)=>{
           if(String(text).length>aiSettingNum(aiSettings,'單次輸入最大字數',300)){throw Object.assign(new Error('AI_INPUT_LIMIT'),{});}
           const startedAt=Date.now();const traceId=crypto.randomBytes(5).toString('hex');const ans=await withLineLoading(uid,aiWaitMsFor('text',aiSettings),()=>gemini(uid,text,`身分：${c?.role||'未完成綁定'}。若問題不是補習班私有資料，可正常回答。`,{settings:aiSettings,snapshot:s,lineName,role:c?.role,traceId}));
           await replyOrPush(event,uid,ans,startedAt,traceId);
-          await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));
-        }catch(e){console.error('ai',e.message);const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。';const traceId=crypto.randomBytes(5).toString('hex');console.error('AI user-facing failure',{traceId,uid,message:e.message});try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt,traceId);}catch(sendErr){console.error('ai error send',sendErr.message);}}
+          aiResponseDelivered=true;
+          {
+            try{await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));}
+            catch(bookErr){console.error('AI post-delivery saveInteraction failed',{traceId,uid,message:bookErr.message});}
+          }
+        }catch(e){console.error('ai',e.message);if(aiResponseDelivered||shouldSuppressSecondUserResponse(event)){console.error('AI failure after response delivery; suppressing second user message',{uid,message:e.message});return;}const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。';const traceId=crypto.randomBytes(5).toString('hex');console.error('AI user-facing failure',{traceId,uid,message:e.message});try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt,traceId);}catch(sendErr){console.error('ai error send',sendErr.message);}}
         return;
       }
     }).catch(e=>console.error('event',{traceId:eventTraceId,uid,message:e?.message||String(e)})).finally(()=>{console.log('LINE event end',{traceId:eventTraceId,uid,totalMs:Date.now()-queuedAt});release();if(cache.locks.get(uid)===current)cache.locks.delete(uid);});
@@ -1745,6 +1783,6 @@ function runAIRouteSelfTest(){
   if(failures.length)console.error('AI route self-test FAILED',failures);else console.log('AI route self-test PASS',{cases:cases.length,probeCases:probeCases.length});
 }
 runAIRouteSelfTest();
-app.listen(PORT,()=>console.log(`LINE customer service server v2.9.5 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.9.10 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

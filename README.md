@@ -93,3 +93,6 @@ V2.9.9 - AI/LINE delivery diagnostics
 - 保留 Gemini B,C,A 優先順序與 model-only cooldown。
 - 新增 traceId、LINE event queueWaitMs、LINE delivery success/failure 診斷，分辨 AI 成功但 LINE 回覆失敗的情況。
 - 不新增 Excel。
+
+
+V2.9.10 修正：避免 AI 回覆已成功送達後，後續 Google Sheets saveInteraction 失敗又進入 catch，再次以 Push 發送錯誤訊息造成雙回覆與 Push 額度消耗。加入 webhookEventId 去重、replyToken delivery 記錄與 delivered 後抑制第二次使用者訊息。
