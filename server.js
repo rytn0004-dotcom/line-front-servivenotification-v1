@@ -267,9 +267,51 @@ async function saveInteraction(s,uid,mode,expire){const old=findInteraction(s,ui
 
 function bindingSummary(d){return d?.role==='老師'?`老師：${d.teacherName||'（未填）'}`:`學生：${(d?.studentNames||[]).join('、')||'（未填）'}`;}
 function roleOf(d){return d?.role==='老師'?'老師':'家長';}
-function bindStart(){return `開始第一次 LINE 綁定。\n\n請先回覆「家長」或「老師」。\n\n首次綁定尚未完成前，最多可以重新輸入 ${INITIAL_REBIND_MAX} 次，用來修正姓名打字錯誤。`;}
+function bindStart(){return `開始第一次 LINE 綁定。\n\n請先選擇您的身分：\n\n家長：請回覆「家長」。\n老師：請回覆「老師」。\n\n首次綁定尚未完成前，最多可以重新輸入 ${INITIAL_REBIND_MAX} 次，用來修正姓名打字錯誤。`;}
 function valuePrompt(role){return role==='老師'?'請輸入系統登記的老師姓名。':'請輸入學生姓名；多位學生請用「、」分隔。';}
-function confirmBind(d){return `請確認要綁定的資料：\n\n${bindingSummary(d)}\n\n確認後會完成 LINE 綁定。課表查詢權限仍需由後台開啟。\n\n請回覆「確認」或「重新輸入」。`;}
+function confirmBind(d){return `請確認要綁定的資料：\n\n${bindingSummary(d)}\n\n確認後會完成 LINE 綁定。課表查詢權限仍需由後台開啟。\n\n請選擇「確認」或「重新輸入」。`;}
+function bindingConfirmChoices(){return [
+  {label:'確認',data:'action=bind_confirm',displayText:'確認'},
+  {label:'重新輸入',data:'action=bind_reenter',displayText:'重新輸入'},
+];}
+async function completeInitialBinding(event,s,uid,lineName,d){
+  const role=roleOf(d);
+  const students=role==='家長'?uniq(d?.studentNames||[]):[];
+  const teacherName=role==='老師'?String(d?.teacherName||'').trim():'';
+  if(role==='家長'&&!students.length){if(event.replyToken)await lineReply(event.replyToken,valuePrompt('家長'));return false;}
+  if(role==='老師'&&!teacherName){if(event.replyToken)await lineReply(event.replyToken,valuePrompt('老師'));return false;}
+  try{
+    await upsertContact(s,uid,lineName,role,students,teacherName,'首次自助綁定；課表查詢權限待管理員確認。');
+    const bd={role,studentNames:students,teacherName,boundAt:nowTaipei(),graceUntil:taipei(BIND_GRACE_MINUTES*60000),correctionUsed:false,initialRebindCount:Number(d?.initialRebindCount||0),pendingAdminRebind:false};
+    await saveBinding(s,uid,'BOUND',bd);
+    if(event.replyToken)await lineReply(event.replyToken,`LINE 綁定完成！\n\n${bindingSummary(bd)}\n\n課表查詢權限目前是「否」，請等管理員確認後開啟。\n\n${BIND_GRACE_MINUTES} 分鐘內如發現打錯，可輸入「更正綁定」修正一次。`);
+    return true;
+  }catch(e){
+    console.error('initial binding confirm failed',{uid,role,students,teacherName,error:e?.stack||e?.message||String(e)});
+    if(event.replyToken)await lineReply(event.replyToken,'綁定資料寫入時發生問題，目前尚未完成綁定。\n\n請再按一次「確認」；如果仍然無法完成，請輸入「重新輸入」後再試一次。');
+    return false;
+  }
+}
+async function handleBindingPostback(event,s,uid,lineName){
+  const data=String(event.postback?.data||'');
+  if(data!=='action=bind_confirm'&&data!=='action=bind_reenter')return false;
+  const b=findBinding(s,uid);
+  const interaction=findInteraction(s,uid);
+  if(!awake(s,uid)||interaction?.mode!=='綁定模式'||b?.status!=='WAIT_BIND_CONFIRM'){
+    if(event.replyToken)await lineReply(event.replyToken,'這次綁定確認已逾時，請重新輸入「綁定」再開始。');
+    return true;
+  }
+  if(data==='action=bind_reenter'){
+    const n=Number(b.data?.initialRebindCount||0)+1;
+    if(n>INITIAL_REBIND_MAX){if(event.replyToken)await lineReply(event.replyToken,`首次綁定最多只能重新輸入 ${INITIAL_REBIND_MAX} 次。`);return true;}
+    const d={...b.data,initialRebindCount:n};
+    await saveBinding(s,uid,'WAIT_BIND_VALUE',d);
+    if(event.replyToken)await lineReply(event.replyToken,`${valuePrompt(d.role)}\n\n這是第 ${n}/${INITIAL_REBIND_MAX} 次重新輸入機會。`);
+    return true;
+  }
+  await completeInitialBinding(event,s,uid,lineName,b.data||{});
+  return true;
+}
 function graceActive(d){return Number.isFinite(parseLocal(d?.graceUntil))&&Date.now()<parseLocal(d.graceUntil);}
 
 
@@ -575,17 +617,9 @@ async function performImageGeneration(event,s,uid,lineName,settings,flow,started
   const steps=imageNumberSetting(settings,'圖片生成步數','CLOUDFLARE_IMAGE_STEPS',DEFAULT_IMAGE_GEN_STEPS,1,8);
   const waitMs=imageNumberSetting(settings,'圖片生成最長等待秒數','CLOUDFLARE_IMAGE_TIMEOUT_MS',DEFAULT_IMAGE_GEN_MAX_WAIT_MS,15000,180000);
   const concurrency=imageNumberSetting(settings,'圖片生成同時處理數','IMAGE_GEN_CONCURRENCY',DEFAULT_IMAGE_GEN_CONCURRENCY,1,4);
-  const role=contactByUid(s,uid)?.role||'未完成綁定';
-  const imageCost=aiSettingNum(settings,'AI 圖片額度',DEFAULT_IMAGE_COST);
-  let aiQuotaReserved=false;
-  let imageGenQuotaReserved=false;
+  await reserveImageGenerationQuota(s,uid,lineName,contactByUid(s,uid)?.role||'未完成綁定',settings);
   let generationSucceeded=false;
   try{
-    // 圖片製作同時受「共同 AI 額度」與「每日生圖張數」兩層限制。
-    await reserveAIQuota(s,uid,lineName,role,settings,flow?.content||'',{cost:imageCost,mediaKind:'image_generation',allowWhenChatDisabled:true});
-    aiQuotaReserved=true;
-    await reserveImageGenerationQuota(s,uid,lineName,role,settings);
-    imageGenQuotaReserved=true;
     const prompt=buildImagePrompt(flow);
     const started=Date.now();
     const buf=await withImageGenSlot(concurrency,()=>callCloudflareImage(prompt,model,steps,waitMs));
@@ -593,21 +627,11 @@ async function performImageGeneration(event,s,uid,lineName,settings,flow,started
     const stored=await storeGeneratedImage(buf);
     const messages=[{type:'image',originalContentUrl:stored.originalUrl,previewImageUrl:stored.previewUrl}];
     await replyOrPushMessages(event,uid,messages,startedAt);
-    console.log('IMAGE success',{provider:'cloudflare-workers-ai',model,steps,uid,aiCost:imageCost,elapsedMs:Date.now()-started});
-  }catch(e){
-    if(!generationSucceeded){
-      if(imageGenQuotaReserved){try{await releaseImageGenerationQuota(uid);}catch(err){console.error('release image quota failed',err.message);}}
-      if(aiQuotaReserved){try{await releaseAIQuota(s,uid,{cost:imageCost});}catch(err){console.error('release shared AI quota failed',err.message);}}
-    }
-    throw e;
-  }
+    console.log('IMAGE success',{provider:'cloudflare-workers-ai',model,steps,uid,elapsedMs:Date.now()-started});
+  }catch(e){if(!generationSucceeded)await releaseImageGenerationQuota(uid);throw e;}
 }
 function imageModePrompt(){return '請先選擇圖片類型：';}
 async function startImageGeneration(event,s,uid,sm){
-  if(/^否|false|0$/i.test(String(sm['圖片製作功能']??'是').trim())){
-    if(event.replyToken)await lineReply(event.replyToken,'目前圖片製作功能暫時關閉，請使用其他已開放功能。');
-    return;
-  }
   setImageGenFlow(uid,{step:'type',type:'',style:'',composition:'',content:''});
   await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
   const note=imageGenConfigured()?'此功能使用免費圖片製作通道；送出前會再次讓您確認。':'此功能尚未完成 Cloudflare 圖片通道設定；仍可先填寫內容，確認製作時會提示管理員處理。';
@@ -855,11 +879,11 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
   return withAIQuotaLock(async()=>{
     resetInMemoryQuota(ai);
     const enabled=!/^否|false|0$/i.test(String(settings['AI 聊天功能']??'是').trim());
-    if(!enabled && !usage.allowWhenChatDisabled)throw new Error('AI_DISABLED');
+    if(!enabled)throw new Error('AI_DISABLED');
     const maxChars=aiSettingNum(settings,'單次輸入最大字數',300);
     if(String(uid||'').length<1)throw new Error('AI_UID');
     const textLen=String(inputText||'').length;
-    if(!usage.skipInputLimit && textLen>maxChars)throw new Error('AI_INPUT_LIMIT');
+    if(textLen>maxChars)throw new Error('AI_INPUT_LIMIT');
 
     const cost=Math.max(1,Number(usage.cost||1));
     const mediaBytes=Math.max(0,Number(usage.mediaBytes||0));
@@ -1644,7 +1668,7 @@ app.post('/webhook',async(req,res)=>{
       const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
       if(event.type==='follow'){await saveInteraction(s,uid,'安靜模式','');queueLog([nowTaipei(),uid,lineName,'follow','','',event.replyToken||'','安靜模式']);const sm=settingsMap(s);if(event.replyToken&&sm['加入好友歡迎訊息']!=='否'){const welcome=sm['加入好友歡迎訊息']||`您好，歡迎加入！\n\n如需服務，請輸入「${sm['喚醒關鍵詞']||'選單'}」。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;await lineReply(event.replyToken,welcome);}return;}
       const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
-      if(event.type==='postback'){if(await handleImageGenPostback(event,s,uid,lineName,sm))return;if(await handleMediaPostback(event,s,uid,lineName,sm))return;}
+      if(event.type==='postback'){if(await handleBindingPostback(event,s,uid,lineName))return;if(await handleImageGenPostback(event,s,uid,lineName,sm))return;if(await handleMediaPostback(event,s,uid,lineName,sm))return;}
       if(event.type!=='message')return;
       const messageType=String(event.message?.type||'');
       const text=messageType==='text'?String(event.message.text||'').trim():'';
@@ -1708,12 +1732,12 @@ app.post('/webhook',async(req,res)=>{
           const role=/^家長$/.test(text)?'家長':/^老師$/.test(text)?'老師':'';if(!role){if(event.replyToken)await lineReply(event.replyToken,'請回覆「家長」或「老師」。');return;}await saveBinding(s,uid,'WAIT_BIND_VALUE',{flow:'initial',role,initialRebindCount:0});if(event.replyToken)await lineReply(event.replyToken,valuePrompt(role));return;
         }
         if(status==='WAIT_BIND_VALUE'){
-          const d={...b.data};if(d.role==='老師')d.teacherName=text;else d.studentNames=splitNames(text);if(d.role==='老師'&&!d.teacherName||d.role==='家長'&&!d.studentNames.length){if(event.replyToken)await lineReply(event.replyToken,valuePrompt(d.role));return;}await saveBinding(s,uid,'WAIT_BIND_CONFIRM',d);if(event.replyToken)await lineReply(event.replyToken,confirmBind(d));return;
+          const d={...b.data};if(d.role==='老師')d.teacherName=text;else d.studentNames=splitNames(text);if(d.role==='老師'&&!d.teacherName||d.role==='家長'&&!d.studentNames.length){if(event.replyToken)await lineReply(event.replyToken,valuePrompt(d.role));return;}await saveBinding(s,uid,'WAIT_BIND_CONFIRM',d);if(event.replyToken)await lineReplyQuick(event.replyToken,confirmBind(d),bindingConfirmChoices());return;
         }
         if(status==='WAIT_BIND_CONFIRM'){
           if(text==='重新輸入'){const n=Number(b.data?.initialRebindCount||0)+1;if(n>INITIAL_REBIND_MAX){if(event.replyToken)await lineReply(event.replyToken,`首次綁定最多只能重新輸入 ${INITIAL_REBIND_MAX} 次。`);return;}const d={...b.data,initialRebindCount:n};await saveBinding(s,uid,'WAIT_BIND_VALUE',d);if(event.replyToken)await lineReply(event.replyToken,`${valuePrompt(d.role)}\n\n這是第 ${n}/${INITIAL_REBIND_MAX} 次重新輸入機會。`);return;}
           if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「重新輸入」。');return;}
-          const d=b.data||{};await upsertContact(s,uid,lineName,d.role,d.studentNames||[],d.teacherName||'','首次自助綁定；課表查詢權限待管理員確認。');const bd={role:d.role,studentNames:d.role==='家長'?uniq(d.studentNames||[]):[],teacherName:d.role==='老師'?String(d.teacherName||'').trim():'',boundAt:nowTaipei(),graceUntil:taipei(BIND_GRACE_MINUTES*60000),correctionUsed:false,initialRebindCount:Number(d.initialRebindCount||0),pendingAdminRebind:false};await saveBinding(s,uid,'BOUND',bd);if(event.replyToken)await lineReply(event.replyToken,`LINE 綁定完成！\n\n${bindingSummary(bd)}\n\n課表查詢權限目前是「否」，請等管理員確認後開啟。\n\n${BIND_GRACE_MINUTES} 分鐘內如發現打錯，可輸入「更正綁定」修正一次。`);return;
+          await completeInitialBinding(event,s,uid,lineName,b.data||{});return;
         }
         if(status==='WAIT_REBIND_VALUE'){
           if(text==='取消'){await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal'});if(event.replyToken)await lineReply(event.replyToken,'已取消更正，原綁定維持不變。');return;}
