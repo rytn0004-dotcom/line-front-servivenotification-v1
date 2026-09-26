@@ -73,6 +73,7 @@ const CLOUDFLARE_ACCOUNT_ID=String(process.env.CLOUDFLARE_ACCOUNT_ID||'').trim()
 const CLOUDFLARE_API_TOKEN=String(process.env.CLOUDFLARE_API_TOKEN||'').trim();
 const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').trim().replace(/\/$/,'');
 const BINDING_GUIDE_PUBLIC_URL=GENERATED_IMAGE_PUBLIC_BASE?`${GENERATED_IMAGE_PUBLIC_BASE}/binding-guide.png`:'';
+const ENABLE_BINDING_GUIDE_IMAGE=/^(1|true|yes|是)$/i.test(String(process.env.ENABLE_BINDING_GUIDE_IMAGE||'false'));
 const CLOUDFLARE_TEXT_MODEL=String(process.env.CLOUDFLARE_TEXT_MODEL||'@cf/google/gemma-4-26b-a4b-it').trim();
 const CLOUDFLARE_TEXT_MODEL_ORDER=Array.from(new Set(String(process.env.CLOUDFLARE_TEXT_MODEL_ORDER||`${CLOUDFLARE_TEXT_MODEL},@cf/zai-org/glm-4.7-flash`).split(',').map(x=>x.trim()).filter(Boolean)));
 const CLOUDFLARE_TEXT_REJECT_IF_BUSY=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_REJECT_IF_BUSY||'true'));
@@ -307,6 +308,7 @@ function imageCompositionChoices(){return [
   {label:'正方形構圖',data:'action=image_comp|v=正方形構圖',displayText:'正方形構圖'},
   {label:'偏直式構圖',data:'action=image_comp|v=偏直式構圖',displayText:'偏直式構圖'},
   {label:'偏橫式構圖',data:'action=image_comp|v=偏橫式構圖',displayText:'偏橫式構圖'},
+  {label:'自訂格式／比例',data:'action=image_comp_custom',displayText:'自訂格式／比例'},
   {label:'取消',data:'action=image_cancel',displayText:'取消'}
 ];}
 function imageConfirmChoices(){return [
@@ -335,7 +337,9 @@ function buildImagePrompt(f){
     '正方形構圖':'balanced square composition with the main subject centered or slightly offset for visual interest',
     '偏直式構圖':'vertical poster-like composition with strong top-to-bottom hierarchy and safe margins',
     '偏橫式構圖':'horizontal banner-like composition with a clear left-to-right visual flow and safe margins'
-  }[composition]||'balanced composition with safe margins';
+  }[composition]||(/自訂：/i.test(composition)
+    ? `custom requested format/aspect guidance: ${composition.replace(/^自訂：/,'')}; preserve the requested layout intent, safe margins, and readable hierarchy; do not invent technical dimensions that the model cannot guarantee`
+    : 'balanced composition with safe margins');
   const hasExplicitText=/(?:標題|文字|文案|寫上|寫著|字樣|名稱|日期|時間|地點|主標|副標)/.test(content);
   const textRule=hasExplicitText
     ?'Render only the text explicitly requested by the user, in Traditional Chinese where applicable. Do not invent extra slogans, prices, dates, names, logos, or small print. Keep requested wording short, large, and legible.'
@@ -571,9 +575,17 @@ async function performImageGeneration(event,s,uid,lineName,settings,flow,started
   const steps=imageNumberSetting(settings,'圖片生成步數','CLOUDFLARE_IMAGE_STEPS',DEFAULT_IMAGE_GEN_STEPS,1,8);
   const waitMs=imageNumberSetting(settings,'圖片生成最長等待秒數','CLOUDFLARE_IMAGE_TIMEOUT_MS',DEFAULT_IMAGE_GEN_MAX_WAIT_MS,15000,180000);
   const concurrency=imageNumberSetting(settings,'圖片生成同時處理數','IMAGE_GEN_CONCURRENCY',DEFAULT_IMAGE_GEN_CONCURRENCY,1,4);
-  await reserveImageGenerationQuota(s,uid,lineName,contactByUid(s,uid)?.role||'未完成綁定',settings);
+  const role=contactByUid(s,uid)?.role||'未完成綁定';
+  const imageCost=aiSettingNum(settings,'AI 圖片額度',DEFAULT_IMAGE_COST);
+  let aiQuotaReserved=false;
+  let imageGenQuotaReserved=false;
   let generationSucceeded=false;
   try{
+    // 圖片製作同時受「共同 AI 額度」與「每日生圖張數」兩層限制。
+    await reserveAIQuota(s,uid,lineName,role,settings,flow?.content||'',{cost:imageCost,mediaKind:'image_generation',allowWhenChatDisabled:true});
+    aiQuotaReserved=true;
+    await reserveImageGenerationQuota(s,uid,lineName,role,settings);
+    imageGenQuotaReserved=true;
     const prompt=buildImagePrompt(flow);
     const started=Date.now();
     const buf=await withImageGenSlot(concurrency,()=>callCloudflareImage(prompt,model,steps,waitMs));
@@ -581,11 +593,21 @@ async function performImageGeneration(event,s,uid,lineName,settings,flow,started
     const stored=await storeGeneratedImage(buf);
     const messages=[{type:'image',originalContentUrl:stored.originalUrl,previewImageUrl:stored.previewUrl}];
     await replyOrPushMessages(event,uid,messages,startedAt);
-    console.log('IMAGE success',{provider:'cloudflare-workers-ai',model,steps,uid,elapsedMs:Date.now()-started});
-  }catch(e){if(!generationSucceeded)await releaseImageGenerationQuota(uid);throw e;}
+    console.log('IMAGE success',{provider:'cloudflare-workers-ai',model,steps,uid,aiCost:imageCost,elapsedMs:Date.now()-started});
+  }catch(e){
+    if(!generationSucceeded){
+      if(imageGenQuotaReserved){try{await releaseImageGenerationQuota(uid);}catch(err){console.error('release image quota failed',err.message);}}
+      if(aiQuotaReserved){try{await releaseAIQuota(s,uid,{cost:imageCost});}catch(err){console.error('release shared AI quota failed',err.message);}}
+    }
+    throw e;
+  }
 }
 function imageModePrompt(){return '請先選擇圖片類型：';}
 async function startImageGeneration(event,s,uid,sm){
+  if(/^否|false|0$/i.test(String(sm['圖片製作功能']??'是').trim())){
+    if(event.replyToken)await lineReply(event.replyToken,'目前圖片製作功能暫時關閉，請使用其他已開放功能。');
+    return;
+  }
   setImageGenFlow(uid,{step:'type',type:'',style:'',composition:'',content:''});
   await saveInteraction(s,uid,'AI圖片製作模式',taipei(Number(sm['AI 對話閒置分鐘數']||25)*60000));
   const note=imageGenConfigured()?'此功能使用免費圖片製作通道；送出前會再次讓您確認。':'此功能尚未完成 Cloudflare 圖片通道設定；仍可先填寫內容，確認製作時會提示管理員處理。';
@@ -594,6 +616,13 @@ async function startImageGeneration(event,s,uid,sm){
 async function handleImageGenPostback(event,s,uid,lineName,sm){
   const data=String(event.postback?.data||'');
   if(data==='action=image_cancel'){clearImageGenFlow(uid);if(event.replyToken)await lineReply(event.replyToken,'已取消圖片製作。');return true;}
+  if(data==='action=image_comp_custom'){
+    const flow=imageGenFlow(uid);
+    if(!flow){if(event.replyToken)await lineReply(event.replyToken,'這次圖片製作要求已逾時，請重新從選單選擇「⑥ 圖片製作」。');return true;}
+    flow.composition='自訂'; flow.step='custom_composition'; flow.at=Date.now(); setImageGenFlow(uid,flow);
+    if(event.replyToken)await lineReply(event.replyToken,'請輸入您希望的圖片格式／比例，例如：「16:9 橫幅」、「9:16 手機直式」、「4:3」、「A4 直式」。\n\n※ 目前使用的免費圖片模型主要把這項設定當作構圖指引，實際輸出尺寸仍由模型決定。');
+    return true;
+  }
   const m=data.match(/^action=image_(type|style|comp)\|v=(.*)$/);if(!m&&!/^action=image_(confirm|edit)$/.test(data))return false;
   const flow=imageGenFlow(uid);if(!flow){if(event.replyToken)await lineReply(event.replyToken,'這次圖片製作要求已逾時，請重新從選單選擇「⑥ 圖片製作」。');return true;}
   const key={type:'type',style:'style',comp:'composition'}[m?.[1]||''];
@@ -641,6 +670,12 @@ async function handleImageGenText(event,s,uid,lineName,sm,text){
   if(flow.step==='type'){flow.type=text;flow.step='style';setImageGenFlow(uid,flow);if(event.replyToken)await lineReplyQuick(event.replyToken,'請選擇圖片風格：',imageStyleChoices());return true;}
   if(flow.step==='style'){flow.style=text;flow.step='composition';setImageGenFlow(uid,flow);if(event.replyToken)await lineReplyQuick(event.replyToken,'請選擇構圖方向（圖片實際輸出維持免費模型支援的尺寸）：',imageCompositionChoices());return true;}
   if(flow.step==='composition'){flow.composition=text;flow.step='content';setImageGenFlow(uid,flow);if(event.replyToken)await lineReply(event.replyToken,'請輸入圖片內容，例如：「暑期數學營招生海報，標題清楚，適合家長閱讀」。內容最多 300 字。');return true;}
+  if(flow.step==='custom_composition'){
+    if(text.length>120){if(event.replyToken)await lineReply(event.replyToken,'自訂格式／比例最多 120 字，請簡短描述，例如「16:9 橫幅」。');return true;}
+    flow.composition=`自訂：${text}`; flow.step='content'; setImageGenFlow(uid,flow);
+    if(event.replyToken)await lineReply(event.replyToken,'已記錄您的自訂格式／比例。\n\n請輸入圖片內容，例如：「暑期數學營招生海報，標題清楚，適合家長閱讀」。內容最多 300 字。');
+    return true;
+  }
   if(flow.step==='content'){
     if(text.length>300){if(event.replyToken)await lineReply(event.replyToken,'圖片內容最多 300 字，請縮短後再送出。');return true;}
     flow.content=text;flow.step='confirm';setImageGenFlow(uid,flow);
@@ -820,11 +855,11 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
   return withAIQuotaLock(async()=>{
     resetInMemoryQuota(ai);
     const enabled=!/^否|false|0$/i.test(String(settings['AI 聊天功能']??'是').trim());
-    if(!enabled)throw new Error('AI_DISABLED');
+    if(!enabled && !usage.allowWhenChatDisabled)throw new Error('AI_DISABLED');
     const maxChars=aiSettingNum(settings,'單次輸入最大字數',300);
     if(String(uid||'').length<1)throw new Error('AI_UID');
     const textLen=String(inputText||'').length;
-    if(textLen>maxChars)throw new Error('AI_INPUT_LIMIT');
+    if(!usage.skipInputLimit && textLen>maxChars)throw new Error('AI_INPUT_LIMIT');
 
     const cost=Math.max(1,Number(usage.cost||1));
     const mediaBytes=Math.max(0,Number(usage.mediaBytes||0));
@@ -1623,7 +1658,7 @@ app.post('/webhook',async(req,res)=>{
         await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));
         const menuText=`您好，請選擇您要使用的功能：(請先完成line綁定，再進行其他查詢)\n\n（目前測試開放：① ④ ⑥）\n① LINE綁定\n② 課程查詢（目前尚未開放）\n③ 繳費／收據（目前尚未開放）\n④ AI客服\n⑤ 人工客服（目前尚未開放）\n⑥ 圖片製作\n輸入「取消」可離開互動模式。 ※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;
         const b=findBinding(s,uid), c=contactByUid(s,uid), isBound=!!(b&&b.status==='BOUND')||c?.status==='已綁定';
-        if(event.replyToken && !isBound && BINDING_GUIDE_PUBLIC_URL){
+        if(event.replyToken && ENABLE_BINDING_GUIDE_IMAGE && !isBound && BINDING_GUIDE_PUBLIC_URL){
           try{
             await lineReplyPayload(event.replyToken,[
               {type:'text',text:formatForLine(menuText)},
