@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.9.8
+# LINE 客服系統 V2.9.11
 
 本版重點：AI 客服「路由防誤擋＋真正失敗降級」。
 
@@ -96,3 +96,21 @@ V2.9.9 - AI/LINE delivery diagnostics
 
 
 V2.9.10 修正：避免 AI 回覆已成功送達後，後續 Google Sheets saveInteraction 失敗又進入 catch，再次以 Push 發送錯誤訊息造成雙回覆與 Push 額度消耗。加入 webhookEventId 去重、replyToken delivery 記錄與 delivered 後抑制第二次使用者訊息。
+
+
+# V2.9.11 LINE 雙回覆防護
+1. Reply API 回覆後，不再因 network timeout / 5xx 等「結果不明」狀況立即改用 Push，避免 Reply 已成功但客戶又收到第二則 Push。
+2. 只有可確認 Reply 未送出的情況（例如 invalid reply token 或 429）才允許 fallback 到 Push。
+3. Push 使用 `X-Line-Retry-Key`，降低 Push 重試造成重複訊息的風險。
+4. 增加 `LINE delivery success` 診斷：Reply／Push、HTTP status、request id、是否使用 retry key。
+5. 若 LINE 發送結果不明，事件標記為 ambiguous；外層錯誤處理不再再送第二則使用者錯誤訊息。
+6. 保留 Gemini B→C→A 優先順序、model-only cooldown、Project-wide cooldown disabled。
+
+
+# V2.9.11 LINE delivery duplicate protection
+- Reply 失敗時，不再對所有錯誤都立即 fallback 到 Push。
+- 只有可確認 Reply 未送出的 400 invalid reply token／429 才允許 Push fallback。
+- Reply timeout／5xx／network error 視為 delivery ambiguous，避免「Reply 實際成功 + Push 再送一次」。
+- Push 加上 `X-Line-Retry-Key`，降低重試造成重複訊息的風險。
+- AI 回覆送出後若後續 Google Sheets saveInteraction 失敗，不再二次回覆使用者。
+- webhookEventId 去重仍保留。

@@ -1451,20 +1451,32 @@ function wasReplyTokenDelivered(token){
   return true;
 }
 function shouldSuppressSecondUserResponse(event){
-  return Boolean(event?.__lineResponseDelivered)||wasReplyTokenDelivered(event?.replyToken);
+  return Boolean(event?.__lineResponseDelivered)||Boolean(event?.__lineResponseAmbiguous)||wasReplyTokenDelivered(event?.replyToken);
 }
 
 async function lineReplyPayload(token,messages){
   const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages})});
-  const raw=r.ok?'':await r.text();
-  if(!r.ok)throw new Error(`LINE reply ${r.status}: ${raw}`);
+  const raw=await r.text();
+  if(!r.ok){const e=new Error(`LINE reply ${r.status}: ${raw}`);e.status=r.status;e.body=raw;throw e;}
   markReplyTokenDelivered(token);
-  return {status:r.status};
+  return {status:r.status,requestId:r.headers.get('x-line-request-id')||''};
 }
 async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
 async function lineReplyQuick(token,text,items){await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
-async function linePush(uid,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);return {status:r.status};}
-async function linePushMessages(uid,messages){const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);return {status:r.status};}
+function isDefinitiveReplyNotSent(error){
+  const status=Number(error?.status||0);
+  const body=String(error?.body||error?.message||'').toLowerCase();
+  if(status===429)return true;
+  if(status===400&&/invalid reply token|reply token.*invalid|couldn't send the message/.test(body))return true;
+  return false;
+}
+function newPushRetryKey(traceId=''){
+  const seed=String(traceId||'')||crypto.randomUUID();
+  const hex=crypto.createHash('sha256').update(`line-push:${seed}`).digest('hex');
+  const variant=(8|(parseInt(hex[16],16)&3)).toString(16);return `${hex.slice(0,8)}-${hex.slice(8,12)}-4${hex.slice(13,16)}-${variant}${hex.slice(17,20)}-${hex.slice(20,32)}`;
+}
+async function linePush(uid,text,retryKey){const display=formatForLine(text);const headers={'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`};if(retryKey)headers['X-Line-Retry-Key']=retryKey;const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers,body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});const raw=await r.text();if(!r.ok){const e=new Error(`LINE push ${r.status}: ${raw}`);e.status=r.status;e.body=raw;throw e;}return {status:r.status,requestId:r.headers.get('x-line-request-id')||''};}
+async function linePushMessages(uid,messages,retryKey){const headers={'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`};if(retryKey)headers['X-Line-Retry-Key']=retryKey;const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers,body:JSON.stringify({to:uid,messages})});const raw=await r.text();if(!r.ok){const e=new Error(`LINE push ${r.status}: ${raw}`);e.status=r.status;e.body=raw;throw e;}return {status:r.status,requestId:r.headers.get('x-line-request-id')||''};}
 async function lineLoading(uid,seconds=50){const r=await fetch('https://api.line.me/v2/bot/chat/loading/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({chatId:uid,loadingSeconds:Math.min(60,Math.max(5,Math.round(seconds/5)*5))})});if(!r.ok)throw new Error(`LINE loading ${r.status}: ${await r.text()}`);}
 async function withLineLoading(uid,waitMs,fn){
   let stopped=false;
@@ -1476,17 +1488,22 @@ async function withLineLoading(uid,waitMs,fn){
 async function replyOrPush(event,uid,text,startedAt,traceId=''){
   const elapsed=Date.now()-startedAt;
   if(event?.replyToken&&elapsed<AI_REPLY_SAFE_WINDOW_MS){
-    try{const result=await lineReply(event.replyToken,text);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'reply',status:result.status,elapsedMs:Date.now()-startedAt});return 'reply';}
-    catch(e){console.error('LINE reply failed, fallback to push',{traceId,elapsedMs:Date.now()-startedAt,message:e.message});}
+    try{const result=await lineReply(event.replyToken,text);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'reply',status:result.status,requestId:result.requestId||'',elapsedMs:Date.now()-startedAt});return 'reply';}
+    catch(e){
+      const definitive=isDefinitiveReplyNotSent(e);
+      console.warn('LINE reply failed',{traceId,elapsedMs:Date.now()-startedAt,status:e.status||0,definitiveNotSent:definitive,message:e.message});
+      if(!definitive){event.__lineResponseAmbiguous=true;throw e;}
+    }
   }
-  try{const result=await linePush(uid,text);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'push',status:result.status,elapsedMs:Date.now()-startedAt});return 'push';}
-  catch(e){console.error('LINE delivery failed',{traceId,method:'push',elapsedMs:Date.now()-startedAt,message:e.message});throw e;}
+  try{const retryKey=newPushRetryKey(traceId);const result=await linePush(uid,text,retryKey);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'push',status:result.status,requestId:result.requestId||'',retryKeyUsed:true,elapsedMs:Date.now()-startedAt});return 'push';}
+  catch(e){event.__lineResponseAmbiguous=true;console.error('LINE delivery failed',{traceId,method:'push',status:e.status||0,elapsedMs:Date.now()-startedAt,message:e.message});throw e;}
 }
-async function replyOrPushMessages(event,uid,messages,startedAt){
+async function replyOrPushMessages(event,uid,messages,startedAt,traceId=''){
   if(event?.replyToken&&Date.now()-startedAt<AI_REPLY_SAFE_WINDOW_MS){
-    try{await lineReplyPayload(event.replyToken,messages);event.__lineResponseDelivered=true;return;}catch(e){console.warn('LINE reply messages failed, fallback to push',e.message);}
+    try{const result=await lineReplyPayload(event.replyToken,messages);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'reply-messages',status:result.status,requestId:result.requestId||'',elapsedMs:Date.now()-startedAt});return;}catch(e){const definitive=isDefinitiveReplyNotSent(e);console.warn('LINE reply messages failed',{traceId,status:e.status||0,definitiveNotSent:definitive,message:e.message});if(!definitive){event.__lineResponseAmbiguous=true;throw e;}}
   }
-  await linePushMessages(uid,messages);event.__lineResponseDelivered=true;
+  try{const retryKey=newPushRetryKey(traceId);const result=await linePushMessages(uid,messages,retryKey);event.__lineResponseDelivered=true;console.log('LINE delivery success',{traceId,method:'push-messages',status:result.status,requestId:result.requestId||'',retryKeyUsed:true,elapsedMs:Date.now()-startedAt});}
+  catch(e){event.__lineResponseAmbiguous=true;throw e;}
 }
 
 async function profile(uid){const r=await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`,{headers:{Authorization:`Bearer ${LINE_TOKEN}`}});return r.ok?r.json():null;}
@@ -1539,7 +1556,7 @@ async function processPendingMediaConfirmed(event,s,uid,lineName,settings,pendin
     const run=()=>aiGenerate(uid,prompt,`這是一個${kind==='image'?'圖片':'PDF 文件'}問答。請嚴格依照使用者提供的${kind==='image'?'圖片':'文件'}與文字要求回答，不得猜測。`,{settings,snapshot:s,lineName,role:contactByUid(s,uid)?.role,useHistory:false,saveHistory:false,temperature:0.1,cost,mediaBytes:media.size,mediaKind:kind,mediaPart:{mimeType:media.mimeType,dataBase64:b64}});
     const ans=await withLineLoading(uid,aiWaitMsFor(kind,settings),run);
     const finalText=ans.finishReason==='MAX_TOKENS'?`${ans.answer}\n\n（回答已接近系統長度上限，已盡量完整整理。）`:ans.answer;
-    await replyOrPush(event,uid,finalText,startedAt);
+    await replyOrPush(event,uid,finalText,startedAt,crypto.randomBytes(5).toString('hex'));
     try{await saveInteraction(s,uid,'AI客服模式',taipei(Number(settings['AI 對話閒置分鐘數']||25)*60000));}
     catch(bookErr){console.error('media post-delivery saveInteraction failed',{uid,message:bookErr.message});}
   });
@@ -1683,7 +1700,7 @@ app.post('/webhook',async(req,res)=>{
           if(!GEMINI_API_KEY){if(event.replyToken)await lineReply(event.replyToken,`目前課程查詢 AI 暫時無法使用，以下提供後端查到的授權課表資料：\n\n${exact}`);return;}
           try{
             const courseSettings=settingsMap(s);const startedAt=Date.now();const ans=await withLineLoading(uid,aiWaitMsFor('text',courseSettings),()=>gemini(uid,`請依照上述後端資料回答這個課程查詢：${text}`,aiContext,{useHistory:false,saveHistory:false,temperature:0.05,settings:courseSettings,snapshot:s,lineName,role:q.role,privateData:true}));
-            await replyOrPush(event,uid,ans,startedAt);await saveInteraction(s,uid,'AI課程查詢模式',taipei(Number(courseSettings['AI 對話閒置分鐘數']||25)*60000));
+            await replyOrPush(event,uid,ans,startedAt,crypto.randomBytes(5).toString('hex'));await saveInteraction(s,uid,'AI課程查詢模式',taipei(Number(courseSettings['AI 對話閒置分鐘數']||25)*60000));
           }catch(aiErr){
             console.error('course gemini',aiErr.message);
             if(!shouldSuppressSecondUserResponse(event)&&event.replyToken)await lineReply(event.replyToken,`AI 文字整理目前暫時無法使用。為避免猜測，以下提供後端查到的授權課表資料：\n\n${exact}`);
@@ -1783,6 +1800,6 @@ function runAIRouteSelfTest(){
   if(failures.length)console.error('AI route self-test FAILED',failures);else console.log('AI route self-test PASS',{cases:cases.length,probeCases:probeCases.length});
 }
 runAIRouteSelfTest();
-app.listen(PORT,()=>console.log(`LINE customer service server v2.9.10 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.9.11 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));
