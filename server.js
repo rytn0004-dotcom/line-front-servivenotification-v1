@@ -746,6 +746,15 @@ function quotaMeta(s){
   return meta;
 }
 function findAIQuota(s,uid){const m=quotaMeta(s);if(!m)return null;for(let i=m.row+1;i<(s.aiQuotas||[]).length;i++){const r=s.aiQuotas[i]||[];if(norm(r[m.uid])===norm(uid))return {row:i+1,r,meta:m};}return null;}
+function nextAIQuotaRow(s,meta){
+  const rows=s.aiQuotas||[];
+  let last=meta?.row??0;
+  for(let i=(meta?.row??0)+1;i<rows.length;i++){
+    const r=rows[i]||[];
+    if(r.some(v=>String(v??'').trim()!==''))last=i;
+  }
+  return last+2;
+}
 function quotaNumber(v,def=0){const n=Number(String(v??'').trim());return Number.isFinite(n)?n:def;}
 function aiSettingNum(settings,key,fallback){const raw=String(settings?.[key]??'').trim();if(raw==='')return fallback;const n=Number(raw);return Number.isFinite(n)&&n>=0?n:fallback;}
 function quotaWriteGroups(meta,rowNo,changes){
@@ -773,10 +782,15 @@ async function ensureAIQuotaRow(s,uid,lineName,role,settings){
   let entry=findAIQuota(s,uid);const m=quotaMeta(s);if(!m)throw new Error('AI 額度管理缺少標準欄位。');
   const baseDefault=aiSettingNum(settings,'每人每日基本額度',5),totalDefault=aiSettingNum(settings,'全站每日總額度',100);
   if(!entry){
+    const rowNo=nextAIQuotaRow(s,m);
     const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,m.maxIndex+1,26)).fill('');
     row[m.uid]=uid;row[m.name]=lineName||'';row[m.role]=role||'未完成綁定';row[m.base]=String(baseDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='待處理';row[m.last]='';row[m.note]='由系統依「系統設定」建立';
     if(m.mediaBytes>=0)row[m.mediaBytes]='0';if(m.mediaDate>=0)row[m.mediaDate]=dayKey();if(m.imageGenCount>=0)row[m.imageGenCount]='0';if(m.imageGenDate>=0)row[m.imageGenDate]=dayKey();
-    await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};await ensureQuotaFormulas(entry.row,m);
+    const changes={uid:row[m.uid],name:row[m.name],role:row[m.role],base:row[m.base],extra:row[m.extra],used:row[m.used],op:row[m.op],opStatus:row[m.opStatus],last:row[m.last],note:row[m.note],mediaBytes:m.mediaBytes>=0?row[m.mediaBytes]:undefined,mediaDate:m.mediaDate>=0?row[m.mediaDate]:undefined,imageGenCount:m.imageGenCount>=0?row[m.imageGenCount]:undefined,imageGenDate:m.imageGenDate>=0?row[m.imageGenDate]:undefined};
+    await writeQuotaFields(m,rowNo,changes);
+    s.aiQuotas.push(row);entry={row:rowNo,r:row,meta:m};
+    await ensureQuotaFormulas(entry.row,m);
+    console.log('AI quota row created',{row:rowNo,uid,role:role||'未完成綁定',writeMode:'fixed-row'});
   }else{
     const changes={};if(m.name>=0&&lineName&&String(entry.r[m.name]||'')!==String(lineName))changes.name=lineName;if(m.role>=0&&String(entry.r[m.role]||'')!==String(role||'未完成綁定'))changes.role=role||'未完成綁定';
     if(Object.keys(changes).length){await writeQuotaFields(m,entry.row,changes);for(const [k,v] of Object.entries(changes))entry.r[m[k]]=v;}
@@ -789,10 +803,14 @@ async function ensureGlobalAIQuota(s,settings){
   let entry=findAIQuota(s,'__GLOBAL__');
   const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
   if(!entry){
+    const rowNo=nextAIQuotaRow(s,m);
     const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,m.maxIndex+1,26)).fill('');
     row[m.uid]='__GLOBAL__';row[m.name]='全站';row[m.role]='全站';row[m.base]=String(totalDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='系統管理';row[m.last]='';row[m.note]='全站上限由「系統設定」控制';if(m.mediaBytes>=0)row[m.mediaBytes]='0';if(m.mediaDate>=0)row[m.mediaDate]=dayKey();if(m.imageGenCount>=0)row[m.imageGenCount]='0';if(m.imageGenDate>=0)row[m.imageGenDate]=dayKey();
-    await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};
+    const changes={uid:row[m.uid],name:row[m.name],role:row[m.role],base:row[m.base],extra:row[m.extra],used:row[m.used],op:row[m.op],opStatus:row[m.opStatus],last:row[m.last],note:row[m.note],mediaBytes:m.mediaBytes>=0?row[m.mediaBytes]:undefined,mediaDate:m.mediaDate>=0?row[m.mediaDate]:undefined,imageGenCount:m.imageGenCount>=0?row[m.imageGenCount]:undefined,imageGenDate:m.imageGenDate>=0?row[m.imageGenDate]:undefined};
+    await writeQuotaFields(m,rowNo,changes);
+    s.aiQuotas.push(row);entry={row:rowNo,r:row,meta:m};
     await ensureQuotaFormulas(entry.row,m);
+    console.log('AI global quota row created',{row:rowNo,writeMode:'fixed-row'});
   }
   entry=await applyQuotaOperation(s,entry,aiSettingNum(settings,'每人每日基本額度',5),totalDefault);
   return entry;

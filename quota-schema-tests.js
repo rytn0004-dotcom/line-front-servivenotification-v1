@@ -25,4 +25,8 @@ assert(writes.some(x=>x.range.startsWith('E12')));
 assert(writes.some(x=>x.range.includes('H12')));
 assert(writes.some(x=>x.range.includes('J12')));
 assert(writes.some(x=>x.range.includes('R12')));
-console.log('V2.9.13 quota schema dynamic-column tests: PASS');
+
+function nextRow(rows,headerRow){ let last=headerRow; for(let i=headerRow+1;i<rows.length;i++){ if((rows[i]||[]).some(v=>String(v??'').trim()!=='')) last=i; } return last+2; }
+const rows=[canonical, ['U1','','家長','5','0','0','','2026-09-26','無','待處理','','可用'], ['', '', '', '', '', '', '=FORMULA', '2026-09-26'], ['', '', '', '', '', '', '0', '2026-09-26']];
+assert.equal(nextRow(rows,0),5);
+console.log('V2.9.14 quota fixed-row schema tests: PASS');
