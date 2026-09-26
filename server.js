@@ -21,6 +21,10 @@ const GEMINI_API_KEY_C=String(process.env.GEMINI_API_KEY_C||'').trim();
 const GEMINI_PROJECT_ID_A=String(process.env.GEMINI_PROJECT_ID_A||'gen-lang-client-0348350940').trim();
 const GEMINI_PROJECT_ID_B=String(process.env.GEMINI_PROJECT_ID_B||'gen-lang-client-0609456009').trim();
 const GEMINI_PROJECT_ID_C=String(process.env.GEMINI_PROJECT_ID_C||'gen-lang-client-0705859251').trim();
+// Gemini Project 優先順序：預設先 B，再 C，最後 A。可由 GEMINI_PROJECT_ORDER 覆寫，例如 A,B,C。
+const GEMINI_PROJECT_ORDER=Array.from(new Set(
+  String(process.env.GEMINI_PROJECT_ORDER||'B,C,A').split(',').map(x=>x.trim().toUpperCase()).filter(x=>['A','B','C'].includes(x))
+));
 const GEMINI_FALLBACK_MODELS=['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-3.1-flash-lite'];
 const GEMINI_CONFIGURED_MODELS=String(process.env.GEMINI_MODEL_ORDER||'').split(',').map(x=>x.trim()).filter(Boolean);
 // 即使 Render 只填單一模型，也自動補齊可用備援模型。
@@ -883,11 +887,13 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
 }
 
 function geminiProjects(){
-  return [
-    {id:'A',key:GEMINI_API_KEY,projectId:GEMINI_PROJECT_ID_A},
-    {id:'B',key:GEMINI_API_KEY_B,projectId:GEMINI_PROJECT_ID_B},
-    {id:'C',key:GEMINI_API_KEY_C,projectId:GEMINI_PROJECT_ID_C}
-  ].filter(x=>x.key&&GEMINI_MODEL_ORDER.length);
+  const all={
+    A:{id:'A',key:GEMINI_API_KEY,projectId:GEMINI_PROJECT_ID_A},
+    B:{id:'B',key:GEMINI_API_KEY_B,projectId:GEMINI_PROJECT_ID_B},
+    C:{id:'C',key:GEMINI_API_KEY_C,projectId:GEMINI_PROJECT_ID_C}
+  };
+  const ordered=GEMINI_PROJECT_ORDER.map(id=>all[id]).filter(Boolean);
+  return ordered.filter(x=>x.key&&GEMINI_MODEL_ORDER.length);
 }
 function providerReady(name){
   if(name==='gemini')return geminiProjects().length>0;
@@ -1126,7 +1132,8 @@ async function aiGenerate(uid,text,context,opts={}){
   const deadline=Date.now()+waitMs;
   const outputMax=outputTokensFor(mediaKind,settings);
   const requestStartedAt=Date.now();
-  console.log('AI request start',{uid,mediaKind:mediaKind||'text',waitMs,outputMax});
+  const traceId=String(opts.traceId||crypto.randomBytes(5).toString('hex'));
+  console.log('AI request start',{traceId,uid,mediaKind:mediaKind||'text',waitMs,outputMax});
   const quotaStartedAt=Date.now();
   const q=await reserveAIQuota(opts.snapshot||{},uid,opts.lineName||'',role,settings,text,{cost:opts.cost||1,mediaBytes:opts.mediaBytes||0,mediaKind:mediaKind});
   const {systemText,geminiContents,messages}=buildAIRequest(text,context,{...opts,uid});
@@ -1163,19 +1170,19 @@ async function aiGenerate(uid,text,context,opts={}){
           const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch});
           const display=String(result.answer).trim();
           if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-          console.log('AI success',{channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:useSearch,totalMs:Date.now()-requestStartedAt});
+          console.log('AI success',{traceId,channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:useSearch,totalMs:Date.now()-requestStartedAt});
           return {answer:display,provider:`gemini:${project.id}:${model}`,model,finishReason:result.finishReason||'',usageMetadata:result.usageMetadata||null};
         }catch(e){
           lastErr=e;const code=errorCode(e);
           if(code===429){
-            if(e.isQuotaExceeded){
-              const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,true);
-              const item={scope:'model',project:project.id,model,reason:'quota-exceeded',remainingMs:duration};
-              skipped.push(item);
-              console.warn('AI Gemini model quota exceeded; keeping other models/project available',{project:project.id,model,remainingMs:duration});
+            const quotaExceeded=!!e.isQuotaExceeded;
+            const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,quotaExceeded);
+            if(quotaExceeded){
+              skipped.push({scope:'model',project:project.id,model,reason:'quota-exceeded',remainingMs:duration});
+              console.warn('AI Gemini model quota exceeded; keeping other models/project available',{project:project.id,model,remainingMs:duration,next:'next-model'});
+            }else{
+              console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:false,retryAfterMs:e.retryAfterMs||0,cooldownMs:duration,next:'next-model'});
             }
-            const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,false);
-            console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:false,retryAfterMs:e.retryAfterMs||0,cooldownMs:duration,next:'next-model'});
           }else if([401,403].includes(code)){
             const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0);
             console.error('AI Gemini model authentication/permission failed; other models remain eligible',{project:project.id,model,code,cooldownMs:duration});
@@ -1210,18 +1217,18 @@ async function aiGenerate(uid,text,context,opts={}){
           const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch:false});
           const display=String(result.answer).trim();
           if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-          console.log('AI success',{channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:false,degradedFromSearch:true,totalMs:Date.now()-requestStartedAt});
+          console.log('AI success',{traceId,channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:false,degradedFromSearch:true,totalMs:Date.now()-requestStartedAt});
           return {answer:display,provider:`gemini:${project.id}:${model}`,model,finishReason:result.finishReason||'',usageMetadata:result.usageMetadata||null};
         }catch(e){
           lastErr=e;
           const code=errorCode(e);
           if(code===429){
-            if(e.isQuotaExceeded){
-              const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,true);
+            const quotaExceeded=!!e.isQuotaExceeded;
+            const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,quotaExceeded);
+            if(quotaExceeded){
               skipped.push({scope:'model',project:project.id,model,reason:'quota-exceeded-degraded-search',remainingMs:duration});
               console.warn('AI Gemini degraded retry hit model quota; keeping project available',{project:project.id,model,remainingMs:duration});
             }
-            setModelCooldown(project.id,model,code,e.retryAfterMs||0,false);
           }else if([401,403].includes(code)){setModelCooldown(project.id,model,code,e.retryAfterMs||0);}
           else if([404,408,409,500,502,503,504].includes(code))setModelCooldown(project.id,model,code,e.retryAfterMs||0);
           console.error('AI Gemini degraded retry failed',{project:project.id,model,code,message:e.message});
@@ -1241,7 +1248,7 @@ async function aiGenerate(uid,text,context,opts={}){
       const result=await callCloudflareTextFallback(degradedSystemText,messages,outputMax,opts.temperature??0.2,timeoutMs,cloudflareAttempts);
       const display=String(result.answer).trim();
       if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
-      console.log('AI success',{channel:'cloudflare-workers-ai-text',model:result.model,uid,totalMs:Date.now()-requestStartedAt});
+      console.log('AI success',{traceId,channel:'cloudflare-workers-ai-text',model:result.model,uid,totalMs:Date.now()-requestStartedAt});
       return {answer:display,provider:`cloudflare:${result.model}`,model:result.model};
     }catch(e){lastErr=e;console.error('Cloudflare text fallback failed',{code:errorCode(e),model:e?.model||'',transport:e?.transport||'',message:e.message,attempts:cloudflareAttempts});}
   }
@@ -1253,14 +1260,14 @@ async function aiGenerate(uid,text,context,opts={}){
         const answer=await callOpenAICompatible(provider,degradedSystemText,messages,outputMax,opts.temperature??0.2,Math.max(10000,Math.min(30000,remaining)));
         const display=String(answer).trim();
         if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
-        console.log('AI success',{channel:provider,uid,totalMs:Date.now()-requestStartedAt});
+        console.log('AI success',{traceId,channel:provider,uid,totalMs:Date.now()-requestStartedAt});
         return {answer:display,provider};
       }catch(e){lastErr=e;console.error('AI provider failed',provider,e.message);if(!shouldUseProviderFallback(e))break;}
     }
   }
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   if(!lastErr)lastErr=Object.assign(new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE'),{code:503});
-  console.error('AI_ALL_PROVIDERS_FAILED summary',{uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
+  console.error('AI_ALL_PROVIDERS_FAILED summary',{traceId,uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
 }
 
@@ -1429,12 +1436,14 @@ async function handleDeferredMediaWithText(event,s,uid,lineName,settings,pending
 
 async function lineReplyPayload(token,messages){
   const r=await fetch('https://api.line.me/v2/bot/message/reply',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({replyToken:token,messages})});
-  if(!r.ok)throw new Error(`LINE reply ${r.status}: ${await r.text()}`);
+  const raw=r.ok?'':await r.text();
+  if(!r.ok)throw new Error(`LINE reply ${r.status}: ${raw}`);
+  return {status:r.status};
 }
 async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
 async function lineReplyQuick(token,text,items){await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
-async function linePush(uid,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
-async function linePushMessages(uid,messages){const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);}
+async function linePush(uid,text){const display=formatForLine(text);const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages:[{type:'text',text:display}]})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);return {status:r.status};}
+async function linePushMessages(uid,messages){const r=await fetch('https://api.line.me/v2/bot/message/push',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({to:uid,messages})});if(!r.ok)throw new Error(`LINE push ${r.status}: ${await r.text()}`);return {status:r.status};}
 async function lineLoading(uid,seconds=50){const r=await fetch('https://api.line.me/v2/bot/chat/loading/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${LINE_TOKEN}`},body:JSON.stringify({chatId:uid,loadingSeconds:Math.min(60,Math.max(5,Math.round(seconds/5)*5))})});if(!r.ok)throw new Error(`LINE loading ${r.status}: ${await r.text()}`);}
 async function withLineLoading(uid,waitMs,fn){
   let stopped=false;
@@ -1443,11 +1452,14 @@ async function withLineLoading(uid,waitMs,fn){
   const timer=setInterval(()=>{void refresh();},LINE_LOADING_REFRESH_MS);
   try{return await fn();}finally{stopped=true;clearInterval(timer);}
 }
-async function replyOrPush(event,uid,text,startedAt){
-  if(event?.replyToken&&Date.now()-startedAt<AI_REPLY_SAFE_WINDOW_MS){
-    try{await lineReply(event.replyToken,text);return;}catch(e){console.warn('LINE reply failed, fallback to push',e.message);}
+async function replyOrPush(event,uid,text,startedAt,traceId=''){
+  const elapsed=Date.now()-startedAt;
+  if(event?.replyToken&&elapsed<AI_REPLY_SAFE_WINDOW_MS){
+    try{const result=await lineReply(event.replyToken,text);console.log('LINE delivery success',{traceId,method:'reply',status:result.status,elapsedMs:Date.now()-startedAt});return 'reply';}
+    catch(e){console.error('LINE reply failed, fallback to push',{traceId,elapsedMs:Date.now()-startedAt,message:e.message});}
   }
-  await linePush(uid,text);
+  try{const result=await linePush(uid,text);console.log('LINE delivery success',{traceId,method:'push',status:result.status,elapsedMs:Date.now()-startedAt});return 'push';}
+  catch(e){console.error('LINE delivery failed',{traceId,method:'push',elapsedMs:Date.now()-startedAt,message:e.message});throw e;}
 }
 async function replyOrPushMessages(event,uid,messages,startedAt){
   if(event?.replyToken&&Date.now()-startedAt<AI_REPLY_SAFE_WINDOW_MS){
@@ -1531,8 +1543,9 @@ app.get('/health',(_req,res)=>res.json({ok:true}));
 
 app.post('/webhook',async(req,res)=>{
   if(!sigOK(req))return res.status(401).send('Invalid signature');res.status(200).send('OK');
-  for(const event of req.body?.events||[]){const uid=event.source?.userId;if(!uid)continue;const prev=cache.locks.get(uid)||Promise.resolve();let release;const current=new Promise(r=>release=r);cache.locks.set(uid,current);
+  for(const event of req.body?.events||[]){const uid=event.source?.userId;if(!uid)continue;const queuedAt=Date.now();const eventTraceId=crypto.randomBytes(5).toString('hex');const prev=cache.locks.get(uid)||Promise.resolve();let release;const current=new Promise(r=>release=r);cache.locks.set(uid,current);
     prev.then(async()=>{
+      console.log('LINE event begin',{traceId:eventTraceId,uid,type:event.type,messageType:event.message?.type||'',textLength:String(event.message?.text||'').length,queueWaitMs:Date.now()-queuedAt});
       const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
       if(event.type==='follow'){await saveInteraction(s,uid,'安靜模式','');queueLog([nowTaipei(),uid,lineName,'follow','','',event.replyToken||'','安靜模式']);const sm=settingsMap(s);if(event.replyToken&&sm['加入好友歡迎訊息']!=='否'){const welcome=sm['加入好友歡迎訊息']||`您好，歡迎加入！\n\n如需服務，請輸入「${sm['喚醒關鍵詞']||'選單'}」。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;await lineReply(event.replyToken,welcome);}return;}
       const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
@@ -1697,13 +1710,13 @@ app.post('/webhook',async(req,res)=>{
             return;
           }
           if(String(text).length>aiSettingNum(aiSettings,'單次輸入最大字數',300)){throw Object.assign(new Error('AI_INPUT_LIMIT'),{});}
-          const startedAt=Date.now();const ans=await withLineLoading(uid,aiWaitMsFor('text',aiSettings),()=>gemini(uid,text,`身分：${c?.role||'未完成綁定'}。若問題不是補習班私有資料，可正常回答。`,{settings:aiSettings,snapshot:s,lineName,role:c?.role}));
-          await replyOrPush(event,uid,ans,startedAt);
+          const startedAt=Date.now();const traceId=crypto.randomBytes(5).toString('hex');const ans=await withLineLoading(uid,aiWaitMsFor('text',aiSettings),()=>gemini(uid,text,`身分：${c?.role||'未完成綁定'}。若問題不是補習班私有資料，可正常回答。`,{settings:aiSettings,snapshot:s,lineName,role:c?.role,traceId}));
+          await replyOrPush(event,uid,ans,startedAt,traceId);
           await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));
-        }catch(e){console.error('ai',e.message);const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。';try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt);}catch(sendErr){console.error('ai error send',sendErr.message);}}
+        }catch(e){console.error('ai',e.message);const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。';const traceId=crypto.randomBytes(5).toString('hex');console.error('AI user-facing failure',{traceId,uid,message:e.message});try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt,traceId);}catch(sendErr){console.error('ai error send',sendErr.message);}}
         return;
       }
-    }).catch(e=>console.error('event',e)).finally(()=>{release();if(cache.locks.get(uid)===current)cache.locks.delete(uid);});
+    }).catch(e=>console.error('event',{traceId:eventTraceId,uid,message:e?.message||String(e)})).finally(()=>{console.log('LINE event end',{traceId:eventTraceId,uid,totalMs:Date.now()-queuedAt});release();if(cache.locks.get(uid)===current)cache.locks.delete(uid);});
   }
 });
 

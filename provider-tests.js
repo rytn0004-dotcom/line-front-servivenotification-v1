@@ -56,3 +56,13 @@ for(const [input,expected] of cases)assert.strictEqual(extractCloudflareTextAnsw
 assert.strictEqual(parseSse('data: {"choices":[{"delta":{"content":"he"}}]}\ndata: {"choices":[{"delta":{"content":"llo"}}]}\ndata: [DONE]'), 'hello');
 assert.strictEqual(extractCloudflareTextAnswer({success:true,result:{}}), '');
 console.log('V2.9.5 provider extraction tests: PASS', {cases:cases.length+2});
+
+
+function orderProjects(order, available){
+  const valid=['A','B','C'];
+  const seq=String(order||'B,C,A').split(',').map(x=>x.trim().toUpperCase()).filter(x=>valid.includes(x));
+  return [...new Set(seq)].filter(x=>available.includes(x));
+}
+const orderResult=orderProjects(process.env.GEMINI_PROJECT_ORDER||'B,C,A',['A','B','C']);
+if(orderResult.join(',')!=='B,C,A') throw new Error('Gemini project order regression');
+console.log('Gemini project order test: PASS',orderResult.join(','));

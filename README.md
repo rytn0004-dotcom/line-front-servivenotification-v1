@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.9.7
+# LINE 客服系統 V2.9.8
 
 本版重點：AI 客服「路由防誤擋＋真正失敗降級」。
 
@@ -65,7 +65,7 @@
 - This prevents a single model failure from taking an otherwise healthy Project out of the rotation.
 
 
-## V2.9.7 Gemini Project mapping / cooldown hotfix
+## V2.9.8 Gemini Project mapping / cooldown hotfix
 1. Gemini A/B/C now expose the actual configured Google Cloud Project IDs in Render diagnostics (Project ID only; no API key is logged).
 2. Confirmed mapping used by this release: A=`gen-lang-client-0348350940`, B=`gen-lang-client-0609456009`, C=`gen-lang-client-0705859251`; Render environment variables `GEMINI_PROJECT_ID_A/B/C` can override these values.
 3. Removed the stale `clearProjectCooldown(...)` call that remained after the model-only cooldown migration and could throw `clearProjectCooldown is not defined`.
@@ -80,3 +80,16 @@ Gemini API preflight OK { project: 'C', projectId: 'gen-lang-client-0705859251',
 ```
 
 The Project IDs are diagnostic identifiers, not secrets. API keys are never logged.
+
+
+## V2.9.8 Gemini 專案優先順序
+- 預設優先順序為 `B → C → A`，也就是先使用 `GEMINI_API_KEY_B`。
+- 可用 `GEMINI_PROJECT_ORDER` 自訂順序，例如 `A,B,C`。
+- Project-wide cooldown 仍停用；冷卻只套用到單一 Project + 單一模型。
+- 429 quota 與一般 429 不再重複設定 cooldown，避免較短 cooldown 覆蓋 quota cooldown。
+
+
+V2.9.9 - AI/LINE delivery diagnostics
+- 保留 Gemini B,C,A 優先順序與 model-only cooldown。
+- 新增 traceId、LINE event queueWaitMs、LINE delivery success/failure 診斷，分辨 AI 成功但 LINE 回覆失敗的情況。
+- 不新增 Excel。

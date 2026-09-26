@@ -77,3 +77,9 @@ V2.9.6 cooldown migration
 - GEMINI_503_COOLDOWN_MS defaults to 20000 (20 seconds).
 - The old GEMINI_PROJECT_QUOTA_COOLDOWN_MS setting is no longer read by the active server and can be removed from Render Environment.
 - Do not add more Gemini keys just to compensate for this issue; test A/B/C again after deployment.
+
+
+V2.9.9 - AI/LINE delivery diagnostics
+- 保留 Gemini B,C,A 優先順序與 model-only cooldown。
+- 新增 traceId、LINE event queueWaitMs、LINE delivery success/failure 診斷，分辨 AI 成功但 LINE 回覆失敗的情況。
+- 不新增 Excel。
