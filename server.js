@@ -129,6 +129,8 @@ const retryable=e=>[429,500,502,503,504].includes(Number(e?.code||e?.response?.s
 async function retry(label,fn){let last;for(let i=0;i<=RETRIES;i++){try{return await fn();}catch(e){last=e;if(!retryable(e)||i>=RETRIES)throw e;await sleep(Math.min(9000,500*2**i)+Math.random()*250);console.warn(label,'retry',i+1);}}throw last;}
 
 function headerRow(rows,required){for(let i=0;i<(rows||[]).length;i++){const set=new Set((rows[i]||[]).map(x=>String(x).trim()));if(required.every(x=>set.has(x)))return i;}return -1;}
+function findContactHeaderRow(rows){for(let i=0;i<(rows||[]).length;i++){const set=new Set((rows[i]||[]).map(x=>String(x).trim()));const hasStudent=set.has('學生姓名/關聯（可多位）')||set.has('學生姓名/關聯');if(set.has('姓名')&&set.has('身分')&&hasStudent&&set.has('LINE User ID'))return i;}return -1;}
+function contactStudentHeader(headers){const h=(headers||[]).map(x=>String(x??'').trim());return h.indexOf('學生姓名/關聯（可多位）')>=0?'學生姓名/關聯（可多位）':(h.indexOf('學生姓名/關聯')>=0?'學生姓名/關聯':'');}
 async function readSnapshot(force=false){
   if(!force&&cache.snapshot&&cache.expiresAt>Date.now())return cache.snapshot;
   if(cache.inFlight)return cache.inFlight;
@@ -136,7 +138,7 @@ async function readSnapshot(force=false){
     const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:AZ`];
     const r=await sheets.spreadsheets.values.batchGet({spreadsheetId:SHEET_ID,ranges,majorDimension:'ROWS'});
     const contacts=r.data.valueRanges?.[0]?.values||[],courses=r.data.valueRanges?.[4]?.values||[],reviews=r.data.valueRanges?.[5]?.values||[],aiQuotas=r.data.valueRanges?.[6]?.values||[];
-    return {contacts,contactsHeaderRow:headerRow(contacts,['姓名','身分','學生姓名/關聯（可多位）','LINE User ID','課表查詢權限']),bindings:r.data.valueRanges?.[1]?.values||[],interactions:r.data.valueRanges?.[2]?.values||[],settings:r.data.valueRanges?.[3]?.values||[],settingsHeaderRow:headerRow(r.data.valueRanges?.[3]?.values||[],['設定項目','目前值']),courses,coursesHeaderRow:headerRow(courses,['Course ID','學生','上課時間']),reviews,reviewsHeaderRow:headerRow(reviews,['申請時間','LINE User ID','申請狀態']),aiQuotas,aiQuotasHeaderRow:headerRow(aiQuotas,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期'])};
+    return {contacts,contactsHeaderRow:findContactHeaderRow(contacts),bindings:r.data.valueRanges?.[1]?.values||[],interactions:r.data.valueRanges?.[2]?.values||[],settings:r.data.valueRanges?.[3]?.values||[],settingsHeaderRow:headerRow(r.data.valueRanges?.[3]?.values||[],['設定項目','目前值']),courses,coursesHeaderRow:headerRow(courses,['Course ID','學生','上課時間']),reviews,reviewsHeaderRow:headerRow(reviews,['申請時間','LINE User ID','申請狀態']),aiQuotas,aiQuotasHeaderRow:headerRow(aiQuotas,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期'])};
   }).then(s=>{cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;cache.inFlight=null;return s;}).catch(e=>{cache.inFlight=null;throw e;});
   return cache.inFlight;
 }
@@ -156,7 +158,7 @@ async function ensureAIQuotaSheet(){
   if((meta.data.sheets||[]).some(x=>x.properties?.title===AI_QUOTA_SHEET))return false;
   await retry('create AI quota sheet',()=>sheets.spreadsheets.batchUpdate({spreadsheetId:SHEET_ID,requestBody:{requests:[{addSheet:{properties:{title:AI_QUOTA_SHEET}}}]}}));
   await update(AI_QUOTA_SHEET,'A1:N5',[[
-    'AI 額度管理｜V1.9.1',null,null,null,null,null,null,null,null,null,null,null,null,'後台操作說明'
+    'AI 額度管理｜目前版本',null,null,null,null,null,null,null,null,null,null,null,null,'後台操作說明'
   ],[
     'LINE User ID','LINE 顯示名稱／姓名','身分','每日基本額度','額外次數','今日已用','剩餘次數','額度日期','額度操作','操作狀態','最後使用時間','備註',null,'操作說明'
   ],[
@@ -216,8 +218,8 @@ async function ensureAIQuotaMediaColumns(){
 async function ensureContactPermissionColumn(){
   const r=await retry('contact schema',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(CONTACT_SHEET)}!A:Z`,majorDimension:'ROWS'}));
   const rows=r.data.values||[];
-  const h=headerRow(rows,['姓名','身分','學生姓名/關聯（可多位）','LINE User ID']);
-  if(h<0)throw new Error('聯絡人找不到標準標題列：姓名、身分、學生姓名/關聯（可多位）、LINE User ID。');
+  const h=findContactHeaderRow(rows);
+  if(h<0)throw new Error('聯絡人找不到標準標題列：姓名、身分、學生姓名/關聯（可多位／學生姓名/關聯）、LINE User ID。');
   const headers=rows[h]||[];
   if(headers.includes('課表查詢權限'))return false;
   let last=-1;for(let i=0;i<headers.length;i++)if(String(headers[i]||'').trim()!=='')last=i;
@@ -237,7 +239,7 @@ async function flushLogs(){if(!logBuffer.length)return;const rows=logBuffer.spli
 function settingsMap(s){const o={};const rows=s.settings||[],h=s.settingsHeaderRow;if(h<0)return o;for(let i=h+1;i<rows.length;i++){const r=rows[i]||[];if(r[0])o[String(r[0])]=String(r[1]||'');}return o;}
 function findBinding(s,uid){for(let i=0;i<(s.bindings||[]).length;i++){const r=s.bindings[i]||[];if(norm(r[0])!==norm(uid))continue;let d={};try{d=JSON.parse(r[2]||'{}');}catch{}return {row:i+1,status:String(r[1]||''),data:d};}return null;}
 function findInteraction(s,uid){let found=null;for(let i=0;i<(s.interactions||[]).length;i++){const r=s.interactions[i]||[];if(norm(r[0])===norm(uid))found={row:i+1,mode:String(r[1]||''),expireAt:String(r[3]||''),updatedAt:String(r[4]||'')};}return found;}
-function contactMeta(s){const rows=s.contacts||[],h=(rows[s.contactsHeaderRow]||[]).map(String).map(x=>x.trim());const idx=n=>h.indexOf(n);return {row:s.contactsHeaderRow,name:idx('姓名'),role:idx('身分'),student:idx('學生姓名/關聯（可多位）'),uid:idx('LINE User ID'),status:idx('綁定狀態'),time:idx('最後綁定時間'),active:idx('通知啟用'),note:idx('備註'),perm:idx('課表查詢權限')};}
+function contactMeta(s){const rows=s.contacts||[],h=(rows[s.contactsHeaderRow]||[]).map(String).map(x=>x.trim());const idx=n=>h.indexOf(n);const studentName=contactStudentHeader(h);return {row:s.contactsHeaderRow,name:idx('姓名'),role:idx('身分'),student:studentName?idx(studentName):-1,uid:idx('LINE User ID'),status:idx('綁定狀態'),time:idx('最後綁定時間'),active:idx('通知啟用'),note:idx('備註'),perm:idx('課表查詢權限')};}
 function contactByUid(s,uid){const m=contactMeta(s);if(m.row<0)return null;for(let i=m.row+1;i<(s.contacts||[]).length;i++){const r=s.contacts[i]||[];if(norm(r[m.uid])===norm(uid))return {row:i+1,role:String(r[m.role]||''),students:splitNames(r[m.student]||''),teacherName:String(String(r[m.role]||'')==='老師'?r[m.student]||'':'').trim(),permission:String(r[m.perm]||''),status:String(r[m.status]||'')};}return null;}
 async function upsertContact(s,uid,lineName,role,students,teacherName,note){
   const rows=s.contacts,m=contactMeta(s);if(m.row<0||m.perm<0)throw new Error('聯絡人缺少必要欄位：課表查詢權限。');
@@ -1869,6 +1871,6 @@ function runAIRouteSelfTest(){
   if(failures.length)console.error('AI route self-test FAILED',failures);else console.log('AI route self-test PASS',{cases:cases.length,probeCases:probeCases.length});
 }
 runAIRouteSelfTest();
-app.listen(PORT,()=>console.log(`LINE customer service server v2.9.11 listening on ${PORT}`));
-(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');{const qm=quotaMeta(s);console.log('AI quota schema map',qm?{headerRow:qm.row+1,columns:Object.fromEntries(['uid','name','role','base','extra','used','remain','date','op','opStatus','last','note','mediaBytes','mediaDate','imageGenCount','imageGenDate','instructions'].filter(k=>qm[k]>=0).map(k=>[k,col(qm[k]+1)])),duplicates:qm.duplicates||{}}:{status:'INVALID'});}await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
+app.listen(PORT,()=>console.log(`LINE customer service server v2.9.19 listening on ${PORT}`));
+(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位／學生姓名/關聯）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');{const qm=quotaMeta(s);console.log('AI quota schema map',qm?{headerRow:qm.row+1,columns:Object.fromEntries(['uid','name','role','base','extra','used','remain','date','op','opStatus','last','note','mediaBytes','mediaDate','imageGenCount','imageGenDate','instructions'].filter(k=>qm[k]>=0).map(k=>[k,col(qm[k]+1)])),duplicates:qm.duplicates||{}}:{status:'INVALID'});}await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

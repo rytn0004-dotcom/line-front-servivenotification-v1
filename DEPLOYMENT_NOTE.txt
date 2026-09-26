@@ -1,4 +1,4 @@
-V2.9.13 deployment note
+V2.9.19 deployment note
 ========================
 
 Core fix:
@@ -13,3 +13,6 @@ Core fix:
 Important:
 - This version does NOT automatically delete or migrate any existing duplicate/legacy blocks in the AI額度管理 sheet.
 - Before production use, inspect the schema map in Render logs once after deployment.
+
+
+V2.9.19 root-cause fix: the live 聯絡人 sheet uses the header「學生姓名/關聯」. The runtime now supports both「學生姓名/關聯」and「學生姓名/關聯（可多位）」for header detection and writes.

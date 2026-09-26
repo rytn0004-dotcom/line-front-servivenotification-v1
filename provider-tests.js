@@ -6,7 +6,7 @@ if (/projectCooldowns|setGeminiProjectQuotaCooldown|GEMINI_PROJECT_QUOTA_COOLDOW
 if (!source.includes("cooldownScope:'model-only'")) throw new Error('Model-only cooldown diagnostic missing');
 for (const id of ['gen-lang-client-0348350940','gen-lang-client-0609456009','gen-lang-client-0705859251']) { if (!source.includes(id)) throw new Error(`Configured Gemini Project ID missing: ${id}`); }
 if (!source.includes('projectCooldownDisabled:true')) throw new Error('Project-wide cooldown disable diagnostic missing');
-console.log('V2.9.7 model-only cooldown + Project mapping regression: PASS');
+console.log('Current model-only cooldown + Project mapping regression: PASS');
 const assert = require('assert');
 
 function textFromContent(value){
@@ -55,7 +55,7 @@ const cases=[
 for(const [input,expected] of cases)assert.strictEqual(extractCloudflareTextAnswer(input),expected);
 assert.strictEqual(parseSse('data: {"choices":[{"delta":{"content":"he"}}]}\ndata: {"choices":[{"delta":{"content":"llo"}}]}\ndata: [DONE]'), 'hello');
 assert.strictEqual(extractCloudflareTextAnswer({success:true,result:{}}), '');
-console.log('V2.9.5 provider extraction tests: PASS', {cases:cases.length+2});
+console.log('Current provider extraction tests: PASS', {cases:cases.length+2});
 
 
 function orderProjects(order, available){
