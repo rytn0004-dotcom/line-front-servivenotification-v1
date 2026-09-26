@@ -251,18 +251,57 @@ async function upsertContact(s,uid,lineName,role,students,teacherName,note){
 }
 
 function reviewMeta(s){const h=(s.reviews[s.reviewsHeaderRow]||[]).map(x=>String(x).trim()),idx=n=>h.indexOf(n);return {row:s.reviewsHeaderRow,time:idx('申請時間'),uid:idx('LINE User ID'),line:idx('LINE 顯示名稱'),role:idx('身分'),current:idx('目前綁定'),requested:idx('申請變更'),status:idx('申請狀態'),result:idx('管理員結果'),processed:idx('處理時間'),note:idx('備註')};}
-function pendingReview(s,uid){const m=reviewMeta(s);if(m.row<0)return null;let hit=null;for(let i=m.row+1;i<s.reviews.length;i++){const r=s.reviews[i]||[];if(norm(r[m.uid])===norm(uid))hit={row:i+1,r,meta:m};}return hit;}
-async function appendReview(s,uid,lineName,role,current,requested){const row=[nowTaipei(),uid,lineName||'',role,current||'',requested||'','待管理員確認','待處理','',''];await append(REVIEW_SHEET,[row]);s.reviews.push(row);cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;}
+function latestReview(s,uid){const m=reviewMeta(s);if(m.row<0)return null;let hit=null;for(let i=m.row+1;i<s.reviews.length;i++){const r=s.reviews[i]||[];if(norm(r[m.uid])===norm(uid))hit={row:i+1,r,meta:m};}return hit;}
+function pendingReview(s,uid){const x=latestReview(s,uid);if(!x)return null;const st=norm(x.r[x.meta.status]);return ['待管理員確認','已核准待輸入','待使用者確認'].includes(st)?x:null;}
+async function appendReview(s,uid,lineName,role,current,requested,opts={}){
+  const row=[nowTaipei(),uid,lineName||'',role,current||'',requested||'','待管理員確認','待處理','',''];
+  if(opts.note)row[9]=opts.note;
+  await append(REVIEW_SHEET,[row]);s.reviews.push(row);cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;return s.reviews.length;
+}
+async function updateReviewRow(s,target,status,result,note=''){
+  const m=target.meta;const row=[...(target.r||[])];row[m.status]=status;if(result!==undefined&&result!==null)row[m.result]=result;row[m.processed]=nowTaipei();if(note)row[m.note]=row[m.note]?`${row[m.note]}；${note}`:note;
+  const width=Math.max(row.length,10);while(row.length<width)row.push('');
+  await update(REVIEW_SHEET,`A${target.row}:${col(width)}${target.row}`,[row]);s.reviews[target.row-1]=row;cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;target.r=row;return row;
+}
+async function createAdminRebindReviewIfNeeded(s,uid,lineName,b){
+  const existing=pendingReview(s,uid);if(existing)return existing;
+  const d=b?.data||{},role=roleOf(d);
+  const current=bindingSummary(d);
+  const requested='待管理員核准後輸入新綁定資料';
+  await appendReview(s,uid,lineName,role,current,requested,{note:'超過3分鐘反悔期；管理員先核准，核准後使用者才能輸入新綁定資料。'});
+  const latest=latestReview(s,uid);
+  const bd={...d,flow:'adminRebindAwaitingApproval',pendingAdminRebind:true,pendingAdminReviewRow:latest?.row||null};
+  await saveBinding(s,uid,'BOUND',bd);
+  return latest;
+}
 async function applyApprovedReview(s,uid,lineName){
-  const m=reviewMeta(s);if(m.row<0)return false;let target=null;
-  for(let i=m.row+1;i<s.reviews.length;i++){const r=s.reviews[i]||[];if(norm(r[m.uid])===norm(uid)&&norm(r[m.status])==='待管理員確認'&&norm(r[m.result])==='核准')target={row:i+1,r};}
-  if(!target)return false;
-  const role=String(target.r[m.role]||'').trim(), requested=String(target.r[m.requested]||'').trim();
+  const target=latestReview(s,uid);if(!target)return {changed:false};
+  const m=target.meta,st=norm(target.r[m.status]),result=norm(target.r[m.result]);
+  if(st==='待管理員確認'&&result==='核准'){
+    const d=findBinding(s,uid)?.data||{};
+    const approvedData={...d,flow:'adminRebindApprovedAwaitingInput',pendingAdminRebind:true,pendingAdminReviewRow:target.row};
+    await saveBinding(s,uid,'WAIT_ADMIN_REBIND_VALUE',approvedData);
+    await updateReviewRow(s,target,'已核准待輸入','核准','管理員已核准，等待使用者輸入新的綁定資料。');
+    return {changed:true,approved:true};
+  }
+  if(st==='待管理員確認'&&result==='拒絕'){
+    const b=findBinding(s,uid),d={...(b?.data||{}),flow:'normal',pendingAdminRebind:false,pendingAdminReviewRow:null};
+    await saveBinding(s,uid,'BOUND',d);
+    await updateReviewRow(s,target,'已拒絕','拒絕','管理員拒絕本次重新綁定申請，原綁定維持不變。');
+    return {changed:true,rejected:true};
+  }
+  return {changed:false};
+}
+async function finalizeApprovedAdminRebind(s,uid,lineName,b){
+  const target=latestReview(s,uid);if(!target)return false;
+  const m=target.meta;if(norm(target.r[m.status])!=='已核准待輸入' || norm(target.r[m.result])!=='核准')return false;
+  const d=b?.data||{},role=roleOf(d),requested=role==='老師'?String(d.pendingTeacherName||'').trim():uniq(d.pendingStudentNames||[]).join('、');
   if(!requested)return false;
-  await upsertContact(s,uid,lineName,role,role==='家長'?splitNames(requested):[],role==='老師'?requested:'','管理員核准的重新綁定；課表查詢權限已重置為否。');
-  const b=findBinding(s,uid),data={role,studentNames:role==='家長'?splitNames(requested):[],teacherName:role==='老師'?requested:'',boundAt:nowTaipei(),graceUntil:taipei(BIND_GRACE_MINUTES*60000),correctionUsed:false,initialRebindCount:0,pendingAdminRebind:false};
-  await saveBinding(s,uid,'BOUND',data);
-  target.r[m.status]='已套用';target.r[m.processed]=nowTaipei();await update(REVIEW_SHEET,`A${target.row}:${col(Math.max(target.r.length,10))}${target.row}`,[target.r]);s.reviews[target.row-1]=target.r;cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;return true;
+  await upsertContact(s,uid,lineName,role,role==='家長'?splitNames(requested):[],role==='老師'?requested:'','管理員已核准重新綁定；新綁定完成後課表查詢權限重置為否。');
+  const bd={role,studentNames:role==='家長'?splitNames(requested):[],teacherName:role==='老師'?requested:'',boundAt:nowTaipei(),graceUntil:taipei(BIND_GRACE_MINUTES*60000),correctionUsed:false,initialRebindCount:Number(d?.initialRebindCount||0),pendingAdminRebind:false,pendingAdminReviewRow:null,flow:'normal'};
+  await saveBinding(s,uid,'BOUND',bd);
+  await updateReviewRow(s,target,'已套用','核准','重新綁定已由使用者輸入新資料並完成套用。');
+  return true;
 }
 async function saveBinding(s,uid,status,data){const old=findBinding(s,uid),row=[uid,status,JSON.stringify(data||{}),nowTaipei()];if(old){await update(BINDING_SHEET,`A${old.row}:D${old.row}`,[row]);s.bindings[old.row-1]=row;}else{await append(BINDING_SHEET,[row]);s.bindings.push(row);}cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;}
 async function saveInteraction(s,uid,mode,expire){const old=findInteraction(s,uid),row=[uid,mode,'',expire||'',nowTaipei()];if(old){await update(INTERACTION_SHEET,`A${old.row}:E${old.row}`,[row]);s.interactions[old.row-1]=row;}else{await append(INTERACTION_SHEET,[row]);s.interactions.push(row);}cache.snapshot=s;cache.expiresAt=Date.now()+SNAPSHOT_TTL;}
@@ -1667,7 +1706,20 @@ app.post('/webhook',async(req,res)=>{
   for(const event of req.body?.events||[]){const webhookEventId=String(event.webhookEventId||'').trim();if(webhookEventId&&seenWebhookEvent(webhookEventId)){console.warn('LINE duplicate webhook event skipped',{webhookEventId,type:event.type});continue;}const uid=event.source?.userId;if(!uid)continue;const queuedAt=Date.now();const eventTraceId=crypto.randomBytes(5).toString('hex');const prev=cache.locks.get(uid)||Promise.resolve();let release;const current=new Promise(r=>release=r);cache.locks.set(uid,current);
     prev.then(async()=>{
       console.log('LINE event begin',{traceId:eventTraceId,uid,type:event.type,messageType:event.message?.type||'',textLength:String(event.message?.text||'').length,queueWaitMs:Date.now()-queuedAt});
-      const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};try{await applyApprovedReview(s,uid,lineName);}catch(e){console.error('apply review',e.message);}
+      const s=await readSnapshot();let lineName='';try{lineName=(await profile(uid))?.displayName||'';}catch{};
+      try{
+        const legacyBinding=findBinding(s,uid);let migratedLegacyRebind=false;
+        if(legacyBinding?.status==='WAIT_ADMIN_REBIND_VALUE' && legacyBinding?.data?.flow==='adminRebind' && legacyBinding?.data?.pendingAdminRebind!==true){
+          await createAdminRebindReviewIfNeeded(s,uid,lineName,{...legacyBinding,status:'BOUND',data:{...legacyBinding.data,pendingAdminRebind:false}});
+          migratedLegacyRebind=true;
+        }
+        if(migratedLegacyRebind){
+          if(event.replyToken)await lineReply(event.replyToken,'已偵測到上一版尚未完成的重新綁定流程，系統已自動改為正式的「綁定審核」流程。\n\n目前原本的 LINE 綁定維持不變；請等待管理員核准後，再依提示輸入新的學生／老師姓名。');return;
+        }
+        const reviewResult=await applyApprovedReview(s,uid,lineName);
+        if(reviewResult?.approved && event.replyToken){await lineReply(event.replyToken,'管理員已核准您的重新綁定申請。現在請輸入新的學生姓名（老師請輸入系統登記姓名）。\n\n輸入「取消」可保留原綁定。');return;}
+        if(reviewResult?.rejected && event.replyToken){await lineReply(event.replyToken,'管理員未核准這次重新綁定申請，原本的 LINE 綁定維持不變。');return;}
+      }catch(e){console.error('apply review',e.stack||e.message);}
       if(event.type==='follow'){await saveInteraction(s,uid,'安靜模式','');queueLog([nowTaipei(),uid,lineName,'follow','','',event.replyToken||'','安靜模式']);const sm=settingsMap(s);if(event.replyToken&&sm['加入好友歡迎訊息']!=='否'){const welcome=sm['加入好友歡迎訊息']||`您好，歡迎加入！\n\n如需服務，請輸入「${sm['喚醒關鍵詞']||'選單'}」。\n\n※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;await lineReply(event.replyToken,welcome);}return;}
       const sm=settingsMap(s),kw=sm['喚醒關鍵詞']||'選單',minutes=Number(sm['互動模式分鐘數']||10)||10;
       if(event.type==='postback'){if(await handleBindingPostback(event,s,uid,lineName))return;if(await handleImageGenPostback(event,s,uid,lineName,sm))return;if(await handleMediaPostback(event,s,uid,lineName,sm))return;}
@@ -1697,7 +1749,9 @@ app.post('/webhook',async(req,res)=>{
         }else if(event.replyToken) await lineReply(event.replyToken,menuText);
         return;
       }
-      if(text==='取消'||text==='取消互動'){clearHistory(uid);await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。\n\n如需服務，請輸入「選單」。');return;}
+      const preBinding=findBinding(s,uid),preBindingStatus=preBinding?.status||'';
+      const inBindingWorkflow=['WAIT_ROLE','WAIT_BIND_VALUE','WAIT_BIND_CONFIRM','WAIT_REBIND_VALUE','WAIT_REBIND_CONFIRM','WAIT_ADMIN_REBIND_VALUE','WAIT_ADMIN_REBIND_CONFIRM'].includes(preBindingStatus);
+      if((text==='取消'||text==='取消互動') && !inBindingWorkflow){clearHistory(uid);await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已離開互動模式。\n\n如需服務，請輸入「選單」。');return;}
       if(looksLikeInternalInfoProbe(text)){if(event.replyToken)await lineReply(event.replyToken,INTERNAL_INFO_REPLY);return;}
 
       // 圖片製作進行中時，優先處理圖片流程，避免數字 1~6 被誤當成主選單快捷鍵。
@@ -1711,11 +1765,22 @@ app.post('/webhook',async(req,res)=>{
 
       if(text==='1'||text==='LINE綁定'||text==='綁定'||text==='開始綁定'||text==='重新綁定'||text==='更正綁定'){
         const b=findBinding(s,uid),c=contactByUid(s,uid);await saveInteraction(s,uid,'綁定模式',taipei(minutes*60000));
-        if(!b||b.status!=='BOUND'){await saveBinding(s,uid,'WAIT_ROLE',{flow:'initial',initialRebindCount:0});if(event.replyToken)await lineReply(event.replyToken,bindStart());return;}
+        if(!b){await saveBinding(s,uid,'WAIT_ROLE',{flow:'initial',initialRebindCount:0});if(event.replyToken)await lineReply(event.replyToken,bindStart());return;}
+        if(b.status!=='BOUND'){
+          if(b.status==='WAIT_ADMIN_REBIND_VALUE'){if(event.replyToken)await lineReply(event.replyToken,`${valuePrompt(roleOf(b.data))}\n\n這筆重新綁定申請已由管理員核准，請輸入新的資料。`);return;}
+          if(b.status==='WAIT_ADMIN_REBIND_CONFIRM'){const p=roleOf(b.data)==='老師'?{role:'老師',teacherName:b.data?.pendingTeacherName}:{role:'家長',studentNames:b.data?.pendingStudentNames||[]};if(event.replyToken)await lineReply(event.replyToken,`請確認新的綁定資料：\n\n${bindingSummary(p)}\n\n請回覆「確認」或「取消」。`);return;}
+          if(b.status==='WAIT_BIND_CONFIRM'){if(event.replyToken)await lineReply(event.replyToken,confirmBind(b.data||{}));return;}
+          if(b.status==='WAIT_BIND_VALUE'){if(event.replyToken)await lineReply(event.replyToken,valuePrompt(roleOf(b.data)));return;}
+          if(b.status==='WAIT_ROLE'){if(event.replyToken)await lineReply(event.replyToken,bindStart());return;}
+          if(event.replyToken)await lineReply(event.replyToken,'目前綁定流程正在處理中，請完成目前步驟後再繼續。');return;
+        }
         if(text==='重新綁定'||text==='更正綁定'){
           if(graceActive(b.data)&&!b.data?.correctionUsed){await saveBinding(s,uid,'WAIT_REBIND_VALUE',{...b.data,flow:'graceCorrection'});if(event.replyToken)await lineReply(event.replyToken,`目前仍在 ${BIND_GRACE_MINUTES} 分鐘反悔期內，可以更正一次。\n\n${valuePrompt(roleOf(b.data))}\n\n輸入「取消」可保留原綁定。`);return;}
-          const pending=pendingReview(s,uid);if(pending&&norm(pending.r[pending.meta.status])==='待管理員確認'){if(event.replyToken)await lineReply(event.replyToken,'您目前已有一筆綁定變更申請等待管理員確認。');return;}
-          await saveBinding(s,uid,'WAIT_ADMIN_REBIND_VALUE',{...b.data,flow:'adminRebind'});if(event.replyToken)await lineReply(event.replyToken,`已超過 ${BIND_GRACE_MINUTES} 分鐘反悔期。新的綁定需要管理員確認。\n\n${valuePrompt(roleOf(b.data))}\n\n輸入「取消」可保留原綁定。`);return;
+          const pending=pendingReview(s,uid);
+          if(pending&&norm(pending.r[pending.meta.status])==='待管理員確認'){if(event.replyToken)await lineReply(event.replyToken,'您目前已有一筆重新綁定申請等待管理員確認。管理員核准後，才能輸入新的學生／老師姓名。');return;}
+          if(pending&&norm(pending.r[pending.meta.status])==='已核准待輸入'){await saveBinding(s,uid,'WAIT_ADMIN_REBIND_VALUE',{...b.data,flow:'adminRebindApprovedAwaitingInput',pendingAdminRebind:true,pendingAdminReviewRow:pending.row});if(event.replyToken)await lineReply(event.replyToken,`管理員已核准重新綁定。\n\n${valuePrompt(roleOf(b.data))}\n\n輸入「取消」可保留原綁定。`);return;}
+          await createAdminRebindReviewIfNeeded(s,uid,lineName,b);
+          if(event.replyToken)await lineReply(event.replyToken,`已超過 ${BIND_GRACE_MINUTES} 分鐘反悔期。\n\n已將「重新綁定」申請送交管理員。\n目前綁定不會改變；管理員核准後，您才可以輸入新的${roleOf(b.data)==='家長'?'學生':'老師'}姓名。`);return;
         }
         if(event.replyToken)await lineReply(event.replyToken,`您已完成 LINE 綁定。\n\n${bindingSummary(b.data)}\n\n課表查詢權限：${c?.permission==='是'?'已開啟':'尚未開啟'}\n\n剛完成綁定時，${BIND_GRACE_MINUTES} 分鐘內可用「更正綁定」修正一次。`);return;
       }
@@ -1729,14 +1794,18 @@ app.post('/webhook',async(req,res)=>{
       if(text==='5'||text==='人工客服'){if(event.replyToken)await lineReply(event.replyToken,'目前家長測試暫未開放「⑤ 人工客服」。本次測試請先使用① LINE綁定、④ AI客服、⑥ 圖片製作。');return;}
 
       const interaction=findInteraction(s,uid),b=findBinding(s,uid),status=b?.status||'UNBOUND';
-      if(awake(s,uid)&&interaction?.mode==='綁定模式'){
+      const bindingFlowActive=(awake(s,uid)&&interaction?.mode==='綁定模式')||['WAIT_ADMIN_REBIND_VALUE','WAIT_ADMIN_REBIND_CONFIRM'].includes(status);
+      if(bindingFlowActive){
         if(status==='WAIT_ROLE'){
+          if(text==='取消'){await saveInteraction(s,uid,'安靜模式','');if(event.replyToken)await lineReply(event.replyToken,'已取消本次綁定。');return;}
           const role=/^家長$/.test(text)?'家長':/^老師$/.test(text)?'老師':'';if(!role){if(event.replyToken)await lineReply(event.replyToken,'請回覆「家長」或「老師」。');return;}await saveBinding(s,uid,'WAIT_BIND_VALUE',{flow:'initial',role,initialRebindCount:0});if(event.replyToken)await lineReply(event.replyToken,valuePrompt(role));return;
         }
         if(status==='WAIT_BIND_VALUE'){
+          if(text==='取消'){await saveBinding(s,uid,'WAIT_ROLE',{flow:'initial',initialRebindCount:Number(b.data?.initialRebindCount||0)});await saveInteraction(s,uid,'綁定模式',taipei(minutes*60000));if(event.replyToken)await lineReply(event.replyToken,'已取消目前輸入，請重新選擇「家長」或「老師」。');return;}
           const d={...b.data};if(d.role==='老師')d.teacherName=text;else d.studentNames=splitNames(text);if(d.role==='老師'&&!d.teacherName||d.role==='家長'&&!d.studentNames.length){if(event.replyToken)await lineReply(event.replyToken,valuePrompt(d.role));return;}await saveBinding(s,uid,'WAIT_BIND_CONFIRM',d);if(event.replyToken)await lineReplyQuick(event.replyToken,confirmBind(d),bindingConfirmChoices());return;
         }
         if(status==='WAIT_BIND_CONFIRM'){
+          if(text==='取消'){await saveBinding(s,uid,'WAIT_ROLE',{flow:'initial',initialRebindCount:Number(b.data?.initialRebindCount||0)});if(event.replyToken)await lineReply(event.replyToken,'已取消本次綁定。');return;}
           if(text==='重新輸入'){const n=Number(b.data?.initialRebindCount||0)+1;if(n>INITIAL_REBIND_MAX){if(event.replyToken)await lineReply(event.replyToken,`首次綁定最多只能重新輸入 ${INITIAL_REBIND_MAX} 次。`);return;}const d={...b.data,initialRebindCount:n};await saveBinding(s,uid,'WAIT_BIND_VALUE',d);if(event.replyToken)await lineReply(event.replyToken,`${valuePrompt(d.role)}\n\n這是第 ${n}/${INITIAL_REBIND_MAX} 次重新輸入機會。`);return;}
           if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「重新輸入」。');return;}
           await completeInitialBinding(event,s,uid,lineName,b.data||{});return;
@@ -1749,10 +1818,29 @@ app.post('/webhook',async(req,res)=>{
           if(text==='取消'){await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal'});if(event.replyToken)await lineReply(event.replyToken,'已取消更正，原綁定維持不變。');return;}if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「取消」。');return;}const d=b.data||{},students=d.pendingStudentNames||[],teacher=d.pendingTeacherName||'';await upsertContact(s,uid,lineName,d.role,students,teacher,'3分鐘反悔期內自助更正；課表查詢權限已重置為否。');const bd={role:d.role,studentNames:d.role==='家長'?students:[],teacherName:d.role==='老師'?teacher:'',boundAt:nowTaipei(),graceUntil:taipei(BIND_GRACE_MINUTES*60000),correctionUsed:true,initialRebindCount:d.initialRebindCount||0,pendingAdminRebind:false};await saveBinding(s,uid,'BOUND',bd);if(event.replyToken)await lineReply(event.replyToken,`綁定已更正。\n\n${bindingSummary(bd)}\n\n課表查詢權限已重置為「否」，請由管理員重新開啟。`);return;
         }
         if(status==='WAIT_ADMIN_REBIND_VALUE'){
-          if(text==='取消'){await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal'});if(event.replyToken)await lineReply(event.replyToken,'已取消重新綁定申請，原綁定維持不變。');return;}const d={...b.data};if(d.role==='老師')d.pendingTeacherName=text;else d.pendingStudentNames=splitNames(text);if(d.role==='老師'&&!d.pendingTeacherName||d.role==='家長'&&!d.pendingStudentNames.length){if(event.replyToken)await lineReply(event.replyToken,valuePrompt(d.role));return;}await saveBinding(s,uid,'WAIT_ADMIN_REBIND_CONFIRM',d);const p=d.role==='老師'?{role:d.role,teacherName:d.pendingTeacherName}:{role:d.role,studentNames:d.pendingStudentNames};if(event.replyToken)await lineReply(event.replyToken,`請確認要送出重新綁定申請：\n\n${bindingSummary(p)}\n\n送出後由管理員確認，不會立即取代目前綁定。\n\n請回覆「確認」或「取消」。`);return;
+          if(text==='取消'){
+            const target=latestReview(s,uid);
+            if(target&&norm(target.r[target.meta.status])==='已核准待輸入')await updateReviewRow(s,target,'已取消','核准','使用者取消重新綁定，原綁定維持不變。');
+            await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal',pendingAdminRebind:false,pendingAdminReviewRow:null});
+            if(event.replyToken)await lineReply(event.replyToken,'已取消重新綁定，原綁定維持不變。');return;
+          }
+          const d={...b.data};if(d.role==='老師')d.pendingTeacherName=text;else d.pendingStudentNames=splitNames(text);
+          if(d.role==='老師'&&!d.pendingTeacherName||d.role==='家長'&&!d.pendingStudentNames.length){if(event.replyToken)await lineReply(event.replyToken,valuePrompt(d.role));return;}
+          await saveBinding(s,uid,'WAIT_ADMIN_REBIND_CONFIRM',d);
+          const p=d.role==='老師'?{role:d.role,teacherName:d.pendingTeacherName}:{role:d.role,studentNames:d.pendingStudentNames};
+          if(event.replyToken)await lineReply(event.replyToken,`請確認新的綁定資料：\n\n${bindingSummary(p)}\n\n這次申請已由管理員核准；確認後才會正式取代原綁定。\n\n請回覆「確認」或「取消」。`);return;
         }
         if(status==='WAIT_ADMIN_REBIND_CONFIRM'){
-          if(text==='取消'){await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal'});if(event.replyToken)await lineReply(event.replyToken,'已取消申請，原綁定維持不變。');return;}if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「取消」。');return;}const d=b.data||{},old=bindingSummary(d),requested=d.role==='老師'?String(d.pendingTeacherName||''):uniq(d.pendingStudentNames||[]).join('、');await appendReview(s,uid,lineName,d.role,old,requested);const c=contactByUid(s,uid),m=contactMeta(s);if(c&&m?.perm>=0){const row=[...(s.contacts[c.row-1]||[])];row[m.perm]='否';await update(CONTACT_SHEET,`A${c.row}:${col(Math.max(10,row.length))}${c.row}`,[row]);s.contacts[c.row-1]=row;}await saveBinding(s,uid,'BOUND',{...d,pendingAdminRebind:true});if(event.replyToken)await lineReply(event.replyToken,'重新綁定申請已送出。為保護資料，課表查詢權限已暫停；請等待管理員確認。');return;
+          if(text==='取消'){
+            const target=latestReview(s,uid);
+            if(target&&norm(target.r[target.meta.status])==='已核准待輸入')await updateReviewRow(s,target,'已取消','核准','使用者取消重新綁定，原綁定維持不變。');
+            await saveBinding(s,uid,'BOUND',{...b.data,flow:'normal',pendingAdminRebind:false,pendingAdminReviewRow:null,pendingTeacherName:undefined,pendingStudentNames:undefined});
+            if(event.replyToken)await lineReply(event.replyToken,'已取消重新綁定，原綁定維持不變。');return;
+          }
+          if(text!=='確認'){if(event.replyToken)await lineReply(event.replyToken,'請回覆「確認」或「取消」。');return;}
+          const ok=await finalizeApprovedAdminRebind(s,uid,lineName,b);
+          if(!ok){if(event.replyToken)await lineReply(event.replyToken,'這筆重新綁定申請狀態已變更，請重新輸入「重新綁定」確認目前狀態。');return;}
+          const nb=findBinding(s,uid);if(event.replyToken)await lineReply(event.replyToken,`重新綁定完成！\n\n${bindingSummary(nb?.data)}\n\n課表查詢權限已重置為「否」，請由管理員重新開啟。`);return;
         }
       }
 
@@ -1871,6 +1959,6 @@ function runAIRouteSelfTest(){
   if(failures.length)console.error('AI route self-test FAILED',failures);else console.log('AI route self-test PASS',{cases:cases.length,probeCases:probeCases.length});
 }
 runAIRouteSelfTest();
-app.listen(PORT,()=>console.log(`LINE customer service server v2.9.19 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`LINE customer service server v2.9.20 listening on ${PORT}`));
 (async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位／學生姓名/關聯）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');{const qm=quotaMeta(s);console.log('AI quota schema map',qm?{headerRow:qm.row+1,columns:Object.fromEntries(['uid','name','role','base','extra','used','remain','date','op','opStatus','last','note','mediaBytes','mediaDate','imageGenCount','imageGenDate','instructions'].filter(k=>qm[k]>=0).map(k=>[k,col(qm[k]+1)])),duplicates:qm.duplicates||{}}:{status:'INVALID'});}await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

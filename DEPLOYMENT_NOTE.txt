@@ -1,18 +1,17 @@
-V2.9.19 deployment note
-========================
+V2.9.20 deployment note
 
-Core fix:
-- AI quota is independent of LINE binding. A user can use AI before binding; the quota row is keyed by LINE User ID and uses role fallback 「未完成綁定」.
-- AI quota fields are located by header names, not hard-coded A/F/I:O/P/Q/R positions.
-- AI quota read range is A:AZ to tolerate legacy/extra columns.
-- Remaining count/date formulas are written to the actual columns found from headers.
-- Media and image-generation quota fields are also header-based.
-- Startup log prints an AI quota schema map and duplicate-header warning.
-- Program fallback for 每人每日基本額度 is 5; 系統設定 remains the authoritative value.
+這版重點是修正「3分鐘反悔期後的重新綁定」流程。
 
-Important:
-- This version does NOT automatically delete or migrate any existing duplicate/legacy blocks in the AI額度管理 sheet.
-- Before production use, inspect the schema map in Render logs once after deployment.
+正式規則：
+1. 超過3分鐘後，使用者只能先建立「綁定審核」，不能先輸入新的學生／老師姓名。
+2. 「綁定審核」中的「管理員結果」由管理員填「核准」或「拒絕」。
+3. 核准後，使用者下一次 LINE 操作才進入 WAIT_ADMIN_REBIND_VALUE。
+4. 使用者輸入新資料後必須再次「確認」，才更新「聯絡人」與「綁定暫存」。
+5. 拒絕／取消都維持原本的 LINE 綁定。
+6. 舊版若已留下 WAIT_ADMIN_REBIND_VALUE + flow=adminRebind，系統會自動補建綁定審核，避免繞過審核。
 
+Excel 對應：
+- 聯絡人：姓名、身分、學生姓名/關聯（或學生姓名/關聯（可多位））、LINE User ID、綁定狀態、最後綁定時間、通知啟用、備註、課表查詢權限。
+- 綁定審核：申請時間、LINE User ID、LINE 顯示名稱、身分、目前綁定、申請變更、申請狀態、管理員結果、處理時間、備註。
 
-V2.9.19 root-cause fix: the live 聯絡人 sheet uses the header「學生姓名/關聯」. The runtime now supports both「學生姓名/關聯」and「學生姓名/關聯（可多位）」for header detection and writes.
+Start Command：node server.js
