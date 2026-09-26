@@ -84,7 +84,6 @@ const ENABLE_CLOUDFLARE_TEXT_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.
 const ALLOW_FRESH_DEGRADED_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.AI_ALLOW_FRESH_DEGRADED_FALLBACK||'true'));
 const AI_ROUTE_FAIL_OPEN=/^(1|true|yes|是)$/i.test(String(process.env.AI_ROUTE_FAIL_OPEN||'true'));
 const AI_CLOUDFLARE_OPENAI_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.AI_CLOUDFLARE_OPENAI_FALLBACK||'true'));
-const MEDIA_RESOURCE_SHEET_COLUMNS={bytes:14,date:15}; // O/P; keep G/H formulas untouched.
 const MEDIA_UPLOAD_TEMP_DIR=process.env.MEDIA_UPLOAD_TEMP_DIR||'/tmp/line-customer-media';
 const AI_MAX_HISTORY_TURNS=Math.max(1,Number(process.env.AI_MAX_HISTORY_TURNS||6));
 const DEFAULT_AI_OUTPUT_TOKENS=500;
@@ -133,7 +132,7 @@ async function readSnapshot(force=false){
   if(!force&&cache.snapshot&&cache.expiresAt>Date.now())return cache.snapshot;
   if(cache.inFlight)return cache.inFlight;
   cache.inFlight=retry('snapshot',async()=>{
-    const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:R`];
+    const ranges=[`${qsheet(CONTACT_SHEET)}!A:Z`,`${qsheet(BINDING_SHEET)}!A:D`,`${qsheet(INTERACTION_SHEET)}!A:E`,`${qsheet(SETTINGS_SHEET)}!A:D`,`${qsheet(COURSE_SHEET)}!A:M`,`${qsheet(REVIEW_SHEET)}!A:J`,`${qsheet(AI_QUOTA_SHEET)}!A:AZ`];
     const r=await sheets.spreadsheets.values.batchGet({spreadsheetId:SHEET_ID,ranges,majorDimension:'ROWS'});
     const contacts=r.data.valueRanges?.[0]?.values||[],courses=r.data.valueRanges?.[4]?.values||[],reviews=r.data.valueRanges?.[5]?.values||[],aiQuotas=r.data.valueRanges?.[6]?.values||[];
     return {contacts,contactsHeaderRow:headerRow(contacts,['姓名','身分','學生姓名/關聯（可多位）','LINE User ID','課表查詢權限']),bindings:r.data.valueRanges?.[1]?.values||[],interactions:r.data.valueRanges?.[2]?.values||[],settings:r.data.valueRanges?.[3]?.values||[],settingsHeaderRow:headerRow(r.data.valueRanges?.[3]?.values||[],['設定項目','目前值']),courses,coursesHeaderRow:headerRow(courses,['Course ID','學生','上課時間']),reviews,reviewsHeaderRow:headerRow(reviews,['申請時間','LINE User ID','申請狀態']),aiQuotas,aiQuotasHeaderRow:headerRow(aiQuotas,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期'])};
@@ -186,33 +185,31 @@ async function ensureMediaSettings(){
   return add.length;
 }
 async function ensureAIQuotaMediaColumns(){
-  const r=await retry('AI quota media schema',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(AI_QUOTA_SHEET)}!A:R`,majorDimension:'ROWS'}));
-  const rows=r.data.values||[];
+  const read=()=>retry('AI quota media schema',()=>sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${qsheet(AI_QUOTA_SHEET)}!A:AZ`,majorDimension:'ROWS'}));
+  let r=await read();
+  let rows=r.data.values||[];
   const h=headerRow(rows,['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期']);
   if(h<0)throw new Error('AI額度管理找不到標準標題列。');
-  const header=rows[h]||[];
-  const updates=[];
-  if(String(header[14]||'').trim()!=='今日媒體 MB')updates.push({range:`O${h+1}`,values:[['今日媒體 MB']]});
-  if(String(header[15]||'').trim()!=='媒體額度日期')updates.push({range:`P${h+1}`,values:[['媒體額度日期']]});
-  if(String(header[16]||'').trim()!=='今日生圖次數')updates.push({range:`Q${h+1}`,values:[['今日生圖次數']]});
-  if(String(header[17]||'').trim()!=='生圖額度日期')updates.push({range:`R${h+1}`,values:[['生圖額度日期']]});
-  for(const u of updates)await update(AI_QUOTA_SHEET,u.range,u.values);
-  const start=h+2,last=rows.length;
-  if(last>=start){
-    const out=[];let changed=false;
-    for(let i=h+1;i<rows.length;i++){
-      const row=rows[i]||[];
-      const vals=[
-        String(row[14]??'').trim()||'0',
-        String(row[15]??'').trim()||dayKey(),
-        String(row[16]??'').trim()||'0',
-        String(row[17]??'').trim()||dayKey()
-      ];
-      out.push(vals);
-      if(String(row[14]??'').trim()!==vals[0]||String(row[15]??'').trim()!==vals[1]||String(row[16]??'').trim()!==vals[2]||String(row[17]??'').trim()!==vals[3])changed=true;
-    }
-    if(changed)await update(AI_QUOTA_SHEET,`O${start}:R${last}`,out);
+  let header=[...(rows[h]||[])];
+  const requiredMedia=['今日媒體 MB','媒體額度日期','今日生圖次數','生圖額度日期'];
+  const existing=new Set(header.map(x=>String(x??'').trim()).filter(Boolean));
+  let last=-1;for(let i=0;i<header.length;i++)if(String(header[i]??'').trim()!=='')last=i;
+  const add=requiredMedia.filter(x=>!existing.has(x));
+  if(add.length){
+    await batchUpdateValues(AI_QUOTA_SHEET,add.map((name,j)=>({range:`${col(last+2+j)}${h+1}`,values:[[name]]})));
+    r=await read();rows=r.data.values||[];header=rows[h]||[];
   }
+  const idx=n=>header.findIndex(x=>String(x??'').trim()===n);
+  const mb=idx('今日媒體 MB'),md=idx('媒體額度日期'),ig=idx('今日生圖次數'),igd=idx('生圖額度日期');
+  const updates=[];
+  for(let i=h+1;i<rows.length;i++){
+    const row=rows[i]||[];
+    if(mb>=0&&String(row[mb]??'').trim()==='')updates.push({range:`${col(mb+1)}${i+1}`,values:[['0']]});
+    if(md>=0&&String(row[md]??'').trim()==='')updates.push({range:`${col(md+1)}${i+1}`,values:[[dayKey()]]});
+    if(ig>=0&&String(row[ig]??'').trim()==='')updates.push({range:`${col(ig+1)}${i+1}`,values:[['0']]});
+    if(igd>=0&&String(row[igd]??'').trim()==='')updates.push({range:`${col(igd+1)}${i+1}`,values:[[dayKey()]]});
+  }
+  if(updates.length)await batchUpdateValues(AI_QUOTA_SHEET,updates);
 }
 
 async function ensureContactPermissionColumn(){
@@ -538,9 +535,8 @@ async function reserveImageGenerationQuota(s,uid,lineName,role,settings){
     if(userCount+1>userLimit)throw new Error('IMAGE_USER_LIMIT');
     if(globalCount+1>globalLimit)throw new Error('IMAGE_GLOBAL_LIMIT');
     u[m.imageGenCount]=String(userCount+1);g[m.imageGenCount]=String(globalCount+1);
-    await batchUpdateValues(AI_QUOTA_SHEET,[
-      {range:`Q${user.row}:R${user.row}`,values:[[u[m.imageGenCount],u[m.imageGenDate]]]},{range:`Q${global.row}:R${global.row}`,values:[[g[m.imageGenCount],g[m.imageGenDate]]] }
-    ]);
+    await writeQuotaFields(m,user.row,{imageGenCount:u[m.imageGenCount],imageGenDate:u[m.imageGenDate]});
+    await writeQuotaFields(global.meta,global.row,{imageGenCount:g[global.meta.imageGenCount],imageGenDate:g[global.meta.imageGenDate]});
     fresh.aiQuotas[user.row-1]=u;fresh.aiQuotas[global.row-1]=g;cache.snapshot=fresh;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
     ai.imageGenCountUsers.set(uid,userCount+1);ai.imageGenCountGlobal=globalCount+1;
     return {userLimit,globalLimit};
@@ -551,9 +547,8 @@ async function releaseImageGenerationQuota(uid){
     const fresh=await readSnapshot(true);const user=findAIQuota(fresh,uid),global=findAIQuota(fresh,'__GLOBAL__');if(!user||!global)return;
     const m=user.meta,gm=global.meta;const uc=Math.max(0,quotaNumber(user.r[m.imageGenCount],0)-1),gc=Math.max(0,quotaNumber(global.r[gm.imageGenCount],0)-1);
     user.r[m.imageGenCount]=String(uc);global.r[gm.imageGenCount]=String(gc);
-    await batchUpdateValues(AI_QUOTA_SHEET,[
-      {range:`Q${user.row}:R${user.row}`,values:[[user.r[m.imageGenCount],user.r[m.imageGenDate]]]},{range:`Q${global.row}:R${global.row}`,values:[[global.r[gm.imageGenCount],global.r[gm.imageGenDate]]]}
-    ]);
+    await writeQuotaFields(m,user.row,{imageGenCount:user.r[m.imageGenCount],imageGenDate:user.r[m.imageGenDate]});
+    await writeQuotaFields(gm,global.row,{imageGenCount:global.r[gm.imageGenCount],imageGenDate:global.r[gm.imageGenDate]});
     fresh.aiQuotas[user.row-1]=user.r;fresh.aiQuotas[global.row-1]=global.r;cache.snapshot=fresh;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
     ai.imageGenCountUsers.set(uid,uc);ai.imageGenCountGlobal=gc;
   });
@@ -738,65 +733,68 @@ function parseTaipeiValue(v){
 function quotaMeta(s){
   const rows=s.aiQuotas||[],h=s.aiQuotasHeaderRow;
   if(h<0)return null;
-  const header=(rows[h]||[]).map(x=>String(x).trim()),idx=n=>header.indexOf(n);
-  return {row:h,uid:idx('LINE User ID'),name:idx('LINE 顯示名稱／姓名'),role:idx('身分'),base:idx('每日基本額度'),extra:idx('額外次數'),used:idx('今日已用'),remain:idx('剩餘次數'),date:idx('額度日期'),op:idx('額度操作'),opStatus:idx('操作狀態'),last:idx('最後使用時間'),note:idx('備註'),mediaBytes:MEDIA_RESOURCE_SHEET_COLUMNS.bytes,mediaDate:MEDIA_RESOURCE_SHEET_COLUMNS.date,imageGenCount:idx('今日生圖次數'),imageGenDate:idx('生圖額度日期')};
+  const header=(rows[h]||[]).map(x=>String(x??'').trim());
+  const canonical=['LINE User ID','LINE 顯示名稱／姓名','身分','每日基本額度','額外次數','今日已用','剩餘次數','額度日期','額度操作','操作狀態','最後使用時間','備註','操作說明'];
+  const pos=n=>header.findIndex(x=>x===n);
+  const meta={row:h};
+  for(const [k,n] of [['uid','LINE User ID'],['name','LINE 顯示名稱／姓名'],['role','身分'],['base','每日基本額度'],['extra','額外次數'],['used','今日已用'],['remain','剩餘次數'],['date','額度日期'],['op','額度操作'],['opStatus','操作狀態'],['last','最後使用時間'],['note','備註'],['instructions','操作說明'],['mediaBytes','今日媒體 MB'],['mediaDate','媒體額度日期'],['imageGenCount','今日生圖次數'],['imageGenDate','生圖額度日期']])meta[k]=pos(n);
+  const required=['uid','base','extra','used','remain','date'];meta.missing=required.filter(k=>meta[k]<0);
+  if(meta.missing.length)return null;
+  meta.maxIndex=Math.max(...Object.values(meta).filter(v=>Number.isInteger(v)));
+  const duplicates={};for(const n of ['LINE User ID','每日基本額度','額外次數','今日已用','剩餘次數','額度日期']){const hits=[];header.forEach((v,i)=>{if(v===n)hits.push(col(i+1));});if(hits.length>1)duplicates[n]=hits;}
+  meta.duplicates=duplicates;
+  return meta;
 }
 function findAIQuota(s,uid){const m=quotaMeta(s);if(!m)return null;for(let i=m.row+1;i<(s.aiQuotas||[]).length;i++){const r=s.aiQuotas[i]||[];if(norm(r[m.uid])===norm(uid))return {row:i+1,r,meta:m};}return null;}
 function quotaNumber(v,def=0){const n=Number(String(v??'').trim());return Number.isFinite(n)?n:def;}
 function aiSettingNum(settings,key,fallback){const raw=String(settings?.[key]??'').trim();if(raw==='')return fallback;const n=Number(raw);return Number.isFinite(n)&&n>=0?n:fallback;}
+function quotaWriteGroups(meta,rowNo,changes){
+  const byIndex=new Map();for(const [name,value] of Object.entries(changes||{})){if(value===undefined)continue;const idx=meta[name];if(Number.isInteger(idx)&&idx>=0)byIndex.set(idx,value);}
+  const entries=[...byIndex.entries()].sort((a,b)=>a[0]-b[0]),groups=[];
+  for(const [idx,value] of entries){const g=groups[groups.length-1];if(g&&g.end===idx-1){g.end=idx;g.values.push(value);}else groups.push({start:idx,end:idx,values:[value]});}
+  return groups.map(g=>({range:`${col(g.start+1)}${rowNo}:${col(g.end+1)}${rowNo}`,values:[g.values]}));
+}
+async function writeQuotaFields(meta,rowNo,changes){const writes=quotaWriteGroups(meta,rowNo,changes);if(writes.length)await batchUpdateValues(AI_QUOTA_SHEET,writes);}
 async function applyQuotaOperation(s,entry,baseDefault,totalDefault){
-  if(!entry)return entry;
-  const m=entry.meta,row=[...(entry.r||[])],op=String(row[m.op]||'').trim();
-  let changed=false;
-  if(op==='+5'||op==='+10'||op==='+20'||op==='+50'){
-    row[m.extra]=String(quotaNumber(row[m.extra],0)+Number(op.slice(1)));
-    row[m.op]='無';row[m.opStatus]='已套用';changed=true;
-  }else if(op==='清除額外次數'){
-    row[m.extra]='0';row[m.op]='無';row[m.opStatus]='已套用';changed=true;
-  }else if(op==='重置今日用量'){
-    row[m.used]='0';row[m.date]=dayKey();row[m.last]='';row[m.op]='無';row[m.opStatus]='已套用';
-    row[m.mediaBytes]='0';row[m.mediaDate]=dayKey();changed=true;
-  }
-  if(changed){
-    // G=剩餘次數與 H=額度日期由試算表公式維護；更新時絕對不要覆蓋公式。
-    const writes=[{range:`A${entry.row}:F${entry.row}`,values:[row.slice(0,6)]},{range:`I${entry.row}:N${entry.row}`,values:[row.slice(8,14)]}];
-    if(m.mediaBytes>=0&&m.mediaDate>=0)writes.push({range:`O${entry.row}:P${entry.row}`,values:[row.slice(14,16)]});
-    await batchUpdateValues(AI_QUOTA_SHEET,writes);
-    s.aiQuotas[entry.row-1]=row;entry.r=row;
-  }
+  if(!entry)return entry;const m=entry.meta,row=[...(entry.r||[])],op=String(row[m.op]||'').trim();let changed=false;
+  if(['+5','+10','+20','+50'].includes(op)){row[m.extra]=String(quotaNumber(row[m.extra],0)+Number(op.slice(1)));row[m.op]='無';row[m.opStatus]='已套用';changed=true;}
+  else if(op==='清除額外次數'){row[m.extra]='0';row[m.op]='無';row[m.opStatus]='已套用';changed=true;}
+  else if(op==='重置今日用量'){row[m.used]='0';row[m.date]=dayKey();row[m.last]='';row[m.op]='無';row[m.opStatus]='已套用';if(m.mediaBytes>=0)row[m.mediaBytes]='0';if(m.mediaDate>=0)row[m.mediaDate]=dayKey();changed=true;}
+  if(changed){const changes={extra:row[m.extra],used:row[m.used],op:row[m.op],opStatus:row[m.opStatus],last:row[m.last]};if(m.mediaBytes>=0)changes.mediaBytes=row[m.mediaBytes];if(m.mediaDate>=0)changes.mediaDate=row[m.mediaDate];await writeQuotaFields(m,entry.row,changes);s.aiQuotas[entry.row-1]=row;entry.r=row;}
   return entry;
 }
-async function ensureQuotaFormulas(rowNo){
-  await update(AI_QUOTA_SHEET,`G${rowNo}`,[[`=IF(A${rowNo}="","",MAX(0,D${rowNo}+E${rowNo}-F${rowNo}))`]]);
-  await update(AI_QUOTA_SHEET,`H${rowNo}`,[[`=IF(A${rowNo}="","",TEXT(TODAY(),"yyyy-mm-dd"))`]]);
+async function ensureQuotaFormulas(rowNo,meta){
+  const writes=[];
+  if(meta.remain>=0)writes.push({range:`${col(meta.remain+1)}${rowNo}`,values:[[`=IF(${col(meta.uid+1)}${rowNo}="","",MAX(0,${col(meta.base+1)}${rowNo}+${col(meta.extra+1)}${rowNo}-${col(meta.used+1)}${rowNo}))`]]});
+  if(meta.date>=0)writes.push({range:`${col(meta.date+1)}${rowNo}`,values:[[`=IF(${col(meta.uid+1)}${rowNo}="","",TEXT(TODAY(),"yyyy-mm-dd"))`]]});
+  if(writes.length)await batchUpdateValues(AI_QUOTA_SHEET,writes);
 }
 async function ensureAIQuotaRow(s,uid,lineName,role,settings){
-  let entry=findAIQuota(s,uid);
-  const m=quotaMeta(s);if(!m)throw new Error('AI 額度管理缺少標準欄位。');
-  const baseDefault=aiSettingNum(settings,'每人每日基本額度',2);
-  const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
+  let entry=findAIQuota(s,uid);const m=quotaMeta(s);if(!m)throw new Error('AI 額度管理缺少標準欄位。');
+  const baseDefault=aiSettingNum(settings,'每人每日基本額度',5),totalDefault=aiSettingNum(settings,'全站每日總額度',100);
   if(!entry){
-    const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,18)).fill('');
-    row[m.uid]=uid;row[m.name]=lineName||'';row[m.role]=role||'';row[m.base]=String(baseDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='待處理';row[m.last]='';row[m.note]='由系統依「系統設定」建立';row[m.mediaBytes]='0';row[m.mediaDate]=dayKey();
-    if(m.imageGenCount>=0)row[m.imageGenCount]='0';
-    if(m.imageGenDate>=0)row[m.imageGenDate]=dayKey();
-    await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};
-    await ensureQuotaFormulas(entry.row);
+    const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,m.maxIndex+1,26)).fill('');
+    row[m.uid]=uid;row[m.name]=lineName||'';row[m.role]=role||'未完成綁定';row[m.base]=String(baseDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='待處理';row[m.last]='';row[m.note]='由系統依「系統設定」建立';
+    if(m.mediaBytes>=0)row[m.mediaBytes]='0';if(m.mediaDate>=0)row[m.mediaDate]=dayKey();if(m.imageGenCount>=0)row[m.imageGenCount]='0';if(m.imageGenDate>=0)row[m.imageGenDate]=dayKey();
+    await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};await ensureQuotaFormulas(entry.row,m);
+  }else{
+    const changes={};if(m.name>=0&&lineName&&String(entry.r[m.name]||'')!==String(lineName))changes.name=lineName;if(m.role>=0&&String(entry.r[m.role]||'')!==String(role||'未完成綁定'))changes.role=role||'未完成綁定';
+    if(Object.keys(changes).length){await writeQuotaFields(m,entry.row,changes);for(const [k,v] of Object.entries(changes))entry.r[m[k]]=v;}
   }
-  entry=await applyQuotaOperation(s,entry,baseDefault,totalDefault);
-  return entry;
+  return applyQuotaOperation(s,entry,baseDefault,totalDefault);
 }
+
 async function ensureGlobalAIQuota(s,settings){
   const m=quotaMeta(s);if(!m)throw new Error('AI 額度管理缺少標準欄位。');
   let entry=findAIQuota(s,'__GLOBAL__');
   const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
   if(!entry){
-    const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,14)).fill('');
-    row[m.uid]='__GLOBAL__';row[m.name]='全站';row[m.role]='全站';row[m.base]=String(totalDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='系統管理';row[m.last]='';row[m.note]='全站上限由「系統設定」控制';row[m.mediaBytes]='0';row[m.mediaDate]=dayKey();
+    const row=Array(Math.max((s.aiQuotas[m.row]||[]).length,m.maxIndex+1,26)).fill('');
+    row[m.uid]='__GLOBAL__';row[m.name]='全站';row[m.role]='全站';row[m.base]=String(totalDefault);row[m.extra]='0';row[m.used]='0';row[m.remain]='';row[m.date]=dayKey();row[m.op]='無';row[m.opStatus]='系統管理';row[m.last]='';row[m.note]='全站上限由「系統設定」控制';if(m.mediaBytes>=0)row[m.mediaBytes]='0';if(m.mediaDate>=0)row[m.mediaDate]=dayKey();if(m.imageGenCount>=0)row[m.imageGenCount]='0';if(m.imageGenDate>=0)row[m.imageGenDate]=dayKey();
     await append(AI_QUOTA_SHEET,[row]);s.aiQuotas.push(row);entry={row:s.aiQuotas.length,r:row,meta:m};
-    await ensureQuotaFormulas(entry.row);
+    await ensureQuotaFormulas(entry.row,m);
   }
-  entry=await applyQuotaOperation(s,entry,aiSettingNum(settings,'每人每日基本額度',2),totalDefault);
+  entry=await applyQuotaOperation(s,entry,aiSettingNum(settings,'每人每日基本額度',5),totalDefault);
   return entry;
 }
 
@@ -813,7 +811,7 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
     const cost=Math.max(1,Number(usage.cost||1));
     const mediaBytes=Math.max(0,Number(usage.mediaBytes||0));
     const mediaKind=String(usage.mediaKind||'').trim();
-    const baseDefault=aiSettingNum(settings,'每人每日基本額度',2);
+    const baseDefault=aiSettingNum(settings,'每人每日基本額度',5);
     const totalDefault=aiSettingNum(settings,'全站每日總額度',100);
     const user=await ensureAIQuotaRow(s,uid,lineName,role,settings);
     const global=await ensureGlobalAIQuota(s,settings);
@@ -828,16 +826,14 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
     if(String(um[uq.mediaDate]||'')!==today){um[uq.mediaBytes]='0';um[uq.mediaDate]=today;userChanged=true;}
     if(String(gm[gq.mediaDate]||'')!==today){gm[gq.mediaBytes]='0';gm[gq.mediaDate]=today;globalChanged=true;}
 
-    const preUsageWrites=[];
     if(userChanged){
-      preUsageWrites.push({range:`A${user.row}:F${user.row}`,values:[um.slice(0,6)]},{range:`I${user.row}:N${user.row}`,values:[um.slice(8,14)]},{range:`O${user.row}:P${user.row}`,values:[um.slice(14,16)]});
+      await writeQuotaFields(uq,user.row,{base:um[uq.base],used:um[uq.used],last:um[uq.last],mediaBytes:uq.mediaBytes>=0?um[uq.mediaBytes]:undefined,mediaDate:uq.mediaDate>=0?um[uq.mediaDate]:undefined});
       s.aiQuotas[user.row-1]=um;
     }
     if(globalChanged){
-      preUsageWrites.push({range:`A${global.row}:F${global.row}`,values:[gm.slice(0,6)]},{range:`I${global.row}:N${global.row}`,values:[gm.slice(8,14)]},{range:`O${global.row}:P${global.row}`,values:[gm.slice(14,16)]});
+      await writeQuotaFields(gq,global.row,{base:gm[gq.base],used:gm[gq.used],last:gm[gq.last],mediaBytes:gq.mediaBytes>=0?gm[gq.mediaBytes]:undefined,mediaDate:gq.mediaDate>=0?gm[gq.mediaDate]:undefined});
       s.aiQuotas[global.row-1]=gm;
     }
-    if(preUsageWrites.length)await batchUpdateValues(AI_QUOTA_SHEET,preUsageWrites);
 
     const userLimit=quotaNumber(um[uq.base],baseDefault)+quotaNumber(um[uq.extra],0);
     const userUsed=quotaNumber(um[uq.used],0);
@@ -872,10 +868,8 @@ async function reserveAIQuota(s,uid,lineName,role,settings,inputText='',usage={}
       um[uq.mediaDate]=today;gm[gq.mediaDate]=today;
     }
 
-    await batchUpdateValues(AI_QUOTA_SHEET,[
-      {range:`F${user.row}`,values:[[um[uq.used]]]},{range:`I${user.row}:K${user.row}`,values:[um.slice(8,11)]},{range:`O${user.row}:P${user.row}`,values:[um.slice(14,16)]},
-      {range:`F${global.row}`,values:[[gm[gq.used]]]},{range:`I${global.row}:K${global.row}`,values:[gm.slice(8,11)]},{range:`O${global.row}:P${global.row}`,values:[gm.slice(14,16)]}
-    ]);
+    await writeQuotaFields(uq,user.row,{used:um[uq.used],op:um[uq.op],opStatus:um[uq.opStatus],last:um[uq.last],mediaBytes:uq.mediaBytes>=0?um[uq.mediaBytes]:undefined,mediaDate:uq.mediaDate>=0?um[uq.mediaDate]:undefined});
+    await writeQuotaFields(gq,global.row,{used:gm[gq.used],op:gm[gq.op],opStatus:gm[gq.opStatus],last:gm[gq.last],mediaBytes:gq.mediaBytes>=0?gm[gq.mediaBytes]:undefined,mediaDate:gq.mediaDate>=0?gm[gq.mediaDate]:undefined});
 
     s.aiQuotas[user.row-1]=um;s.aiQuotas[global.row-1]=gm;
     ai.users.set(uid,userUsed+cost);ai.total=globalUsed+cost;ai.lastUse.set(uid,Date.now());
@@ -1101,10 +1095,8 @@ async function releaseAIQuota(s,uid,usage={}){
       um[uq.mediaBytes]=String(Math.max(0,quotaNumber(um[uq.mediaBytes],0)-mediaBytes/1024/1024));
       gm[gq.mediaBytes]=String(Math.max(0,quotaNumber(gm[gq.mediaBytes],0)-mediaBytes/1024/1024));
     }
-    await batchUpdateValues(AI_QUOTA_SHEET,[
-      {range:`F${user.row}`,values:[[um[uq.used]]]},{range:`O${user.row}:P${user.row}`,values:[um.slice(14,16)]},
-      {range:`F${global.row}`,values:[[gm[gq.used]]]},{range:`O${global.row}:P${global.row}`,values:[gm.slice(14,16)]}
-    ]);
+    await writeQuotaFields(uq,user.row,{used:um[uq.used],mediaBytes:uq.mediaBytes>=0?um[uq.mediaBytes]:undefined,mediaDate:uq.mediaDate>=0?um[uq.mediaDate]:undefined});
+    await writeQuotaFields(gq,global.row,{used:gm[gq.used],mediaBytes:gq.mediaBytes>=0?gm[gq.mediaBytes]:undefined,mediaDate:gq.mediaDate>=0?gm[gq.mediaDate]:undefined});
     fresh.aiQuotas[user.row-1]=um;fresh.aiQuotas[global.row-1]=gm;cache.snapshot=fresh;cache.expiresAt=Date.now()+SNAPSHOT_TTL;
     const memUsed=Math.max(0,(ai.users.get(uid)||cost)-cost);ai.users.set(uid,memUsed);ai.total=Math.max(0,(ai.total||cost)-cost);
     ai.mediaBytesUsers.set(uid,quotaNumber(um[uq.mediaBytes],0)*1024*1024);
@@ -1801,5 +1793,5 @@ function runAIRouteSelfTest(){
 }
 runAIRouteSelfTest();
 app.listen(PORT,()=>console.log(`LINE customer service server v2.9.11 listening on ${PORT}`));
-(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
+(async()=>{try{await ensureReviewSheet();await ensureAIQuotaSheet();await ensureMediaSettings();await ensureAIQuotaMediaColumns();await ensureContactPermissionColumn();const s=await readSnapshot(true);const checks=[[s.contactsHeaderRow>=0,'聯絡人必須包含：姓名、身分、學生姓名/關聯（可多位）、LINE User ID、課表查詢權限'],[s.coursesHeaderRow>=0,'實際課程必須包含：Course ID、學生、上課時間'],[s.settingsHeaderRow>=0,'系統設定必須包含：設定項目、目前值'],[s.reviewsHeaderRow>=0,'綁定審核標題列不存在'],[s.aiQuotasHeaderRow>=0,'AI額度管理必須包含標準欄位']];const bad=checks.filter(x=>!x[0]).map(x=>x[1]);if(bad.length)throw new Error(`Excel schema error: ${bad.join('；')}`);console.log('Excel master schema check complete.');{const qm=quotaMeta(s);console.log('AI quota schema map',qm?{headerRow:qm.row+1,columns:Object.fromEntries(['uid','name','role','base','extra','used','remain','date','op','opStatus','last','note','mediaBytes','mediaDate','imageGenCount','imageGenDate','instructions'].filter(k=>qm[k]>=0).map(k=>[k,col(qm[k]+1)])),duplicates:qm.duplicates||{}}:{status:'INVALID'});}await geminiAuthPreflight();await cloudflareAuthPreflight();}catch(e){console.error('Startup preflight failed:',e.stack||e.message);}})();
 process.on('uncaughtException',e=>console.error('Uncaught exception',e));process.on('unhandledRejection',e=>console.error('Unhandled rejection',e));

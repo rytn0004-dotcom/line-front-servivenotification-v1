@@ -1,4 +1,4 @@
-# LINE 客服系統 V2.9.11
+# LINE 客服系統 V2.9.12
 
 本版重點：AI 客服「路由防誤擋＋真正失敗降級」。
 
@@ -98,7 +98,7 @@ V2.9.9 - AI/LINE delivery diagnostics
 V2.9.10 修正：避免 AI 回覆已成功送達後，後續 Google Sheets saveInteraction 失敗又進入 catch，再次以 Push 發送錯誤訊息造成雙回覆與 Push 額度消耗。加入 webhookEventId 去重、replyToken delivery 記錄與 delivered 後抑制第二次使用者訊息。
 
 
-# V2.9.11 LINE 雙回覆防護
+# V2.9.12 LINE 雙回覆防護
 1. Reply API 回覆後，不再因 network timeout / 5xx 等「結果不明」狀況立即改用 Push，避免 Reply 已成功但客戶又收到第二則 Push。
 2. 只有可確認 Reply 未送出的情況（例如 invalid reply token 或 429）才允許 fallback 到 Push。
 3. Push 使用 `X-Line-Retry-Key`，降低 Push 重試造成重複訊息的風險。
@@ -107,10 +107,27 @@ V2.9.10 修正：避免 AI 回覆已成功送達後，後續 Google Sheets saveI
 6. 保留 Gemini B→C→A 優先順序、model-only cooldown、Project-wide cooldown disabled。
 
 
-# V2.9.11 LINE delivery duplicate protection
+# V2.9.12 LINE delivery duplicate protection
 - Reply 失敗時，不再對所有錯誤都立即 fallback 到 Push。
 - 只有可確認 Reply 未送出的 400 invalid reply token／429 才允許 Push fallback。
 - Reply timeout／5xx／network error 視為 delivery ambiguous，避免「Reply 實際成功 + Push 再送一次」。
 - Push 加上 `X-Line-Retry-Key`，降低重試造成重複訊息的風險。
 - AI 回覆送出後若後續 Google Sheets saveInteraction 失敗，不再二次回覆使用者。
 - webhookEventId 去重仍保留。
+
+
+V2.9.12：修正首次加入好友綁定流程圖空白顯示：改用 JPEG 原圖＋獨立預覽 JPEG；follow 事件直接以同一次 Reply 回傳文字與流程圖；選單未綁定使用者仍可收到流程圖。啟動時檢查圖檔存在與大小並記錄公開 URL。
+
+
+V2.9.13 AI 額度欄位對齊修正版
+==============================
+1. AI 額度不要求已完成 LINE 綁定；未綁定使用者仍以 LINE User ID 建立個人額度列，身分顯示為「未完成綁定」。
+2. AI額度管理不再假設固定 A:R、O:P、Q:R 位置；改依標題名稱定位欄位。
+3. AI 額度讀取範圍擴大到 A:AZ，避免工作表已有舊欄位／額外欄位時讀取不完整。
+4. 剩餘次數與額度日期公式依實際欄位位置寫入，不再硬寫 G/H。
+5. 每日基本額度程式 fallback 改為 5；仍優先使用「系統設定」中的實際值。
+6. 啟動時會輸出 AI quota schema map，列出實際欄位位置與重複標題警告，不含 API secret。
+7. 使用者名稱／身分會在既有額度列同步更新，但不重新建立重複列。
+8. 生圖與媒體額度欄位亦改成依標題定位，避免欄位錯位。
+
+注意：本次尚未自動搬移或刪除既有工作表中的舊／重複資料區塊；程式只停止繼續錯位寫入，並以找到的標題欄位作為正式資料位置。
