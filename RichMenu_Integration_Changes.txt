@@ -1,0 +1,25 @@
+LINE 客服 V2.9.20 + Rich Menu 模組整合說明
+
+本包是以使用者提供的 LINE 客服系統 V2.9.20 ZIP 為基礎。
+
+修改檔案：
+1. server.js
+   - 新增 1 個 require：./richmenu/richmenu
+   - 啟動初始化流程加入 setupRichMenu()；失敗只記錄錯誤，不中止客服服務。
+2. .env.example
+   - 新增 RICH_MENU_ENABLED / CONFIG_PATH / IMAGE_PATH 範例。
+3. README.md
+   - 新增 Rich Menu 模組說明。
+
+新增檔案：
+4. richmenu/richmenu.js
+5. richmenu/richmenu.json
+6. richmenu/richmenu.png
+7. richmenu/README.md
+8. richmenu-tests.js
+
+重要：
+- 沒有修改 package.json，因此沒有新增 npm 套件。
+- RICH_MENU_ENABLED 預設為 false；不開啟 Render 環境變數時，Rich Menu 不會呼叫 LINE API。
+- 啟用後，會把這個 Rich Menu 設為 LINE Official Account 的 Default Rich Menu；這會改變 LINE 聊天畫面下方的 Rich Menu，但不會取代既有 webhook / 客服程式。
+- 現有 Rich Menu 若由每位使用者單獨綁定，LINE 的個人 Rich Menu 顯示優先級可能高於 Default Rich Menu。

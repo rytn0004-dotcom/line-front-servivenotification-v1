@@ -46,3 +46,21 @@ Start Command：`node server.js`
 `① LINE綁定 → 家長 → 學生姓名 → 確認`
 `→ 3分鐘內「更正綁定」`
 `→ 超過3分鐘「更正綁定」→ 查看「綁定審核」→ 管理員核准 → 輸入新姓名 → 確認`
+
+## Rich Menu 模組（獨立、可選）
+
+本版本另外加入 `richmenu/`，不取代原本的 LINE 客服邏輯，也不新增 npm 套件。`RICH_MENU_ENABLED` 預設為 `false`，因此只要不開啟 Render 變數，現有服務行為不會因 Rich Menu 模組而改變。
+
+啟用時，在 Render Environment Variables 加入：
+
+```text
+RICH_MENU_ENABLED=true
+RICH_MENU_CONFIG_PATH=richmenu/richmenu.json
+RICH_MENU_IMAGE_PATH=richmenu/richmenu.png
+```
+
+Rich Menu 會在服務啟動時依序進行「驗證 → 查找相同版本 → 必要時建立 → 上傳圖片 → 設為 Default」。設定與圖片都沒有改變時會重用現有 Rich Menu；因此 Render 重啟不會每次建立新選單。
+
+Rich Menu 的按鈕使用既有文字指令（1、2、4、5、6、功能選單），點擊後仍由原本 `/webhook` 處理，因此不需要新增第二個 webhook。
+
+如需換成正式設計，只需替換 `richmenu/richmenu.png`，並依新按鈕位置調整 `richmenu/richmenu.json` 的 `areas`；LINE 目前要求 Rich Menu 圖片為 JPEG/PNG、寬度 800–2500px、高度至少 250px、長寬比至少 1.45，檔案大小上限 1 MB。citeturn887434search5
