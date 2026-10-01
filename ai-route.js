@@ -18,6 +18,17 @@ function needsFreshWeb(text){
   ].some(re=>re.test(t));
   if(explicitWebSearch)return true;
 
+  // Broad intent signals: explicit lookup verbs, time-sensitive questions, and changing technical facts.
+  const explicitSearchIntent=/(?:上網|網路|網上|網頁).{0,24}(?:搜尋|搜索|查|找|確認|核實|比較)|(?:搜尋|搜索|查詢|查一下|查查看|查找|找一下|找資料|幫我查|幫我找|look up|search online|search the web|browse|find out)/i.test(t);
+  const timeSensitiveSignal=/(?:今天|今日|現在|目前|現今|最新|近期|最近|剛剛|明天|明日|本週|這週|下週|今年|現任|截至目前|截至現在|當前)/i.test(t);
+  const questionSignal=/(?:嗎|？|\?|是否|能否|能不能|可不可以|是不是|為什麼|為何|怎麼|如何|誰|哪裡|哪個|何時|幾點|多少|有哪些)/i.test(t);
+  const technicalTopic=/(?:Gemini|Google|ChatGPT|OpenAI|API|LLM|模型|版本|系統|服務|產品|功能|平台|App|應用程式|GitHub|Render|LINE)/i.test(t);
+  const changingTechnicalFact=/(?:支援|推出|發布|更新|停用|下架|開放|可用|限制|錯誤|失敗|故障|異常|原因|價格|費用|收費|費率|額度|配額|429|503|變更|改版)/i.test(t);
+  const definitionOnly=/(?:是什麼|什麼意思|定義|概念)/i.test(t)&&!timeSensitiveSignal&&!/(?:幫我|請|麻煩|look up|search|搜尋一下|查一下)/i.test(t);
+  if(explicitSearchIntent&&!definitionOnly)return true;
+  if(timeSensitiveSignal&&questionSignal)return true;
+  if(technicalTopic&&changingTechnicalFact&&(questionSignal||/(?:錯誤|失敗|故障|異常|429|503)/i.test(t)))return true;
+
   const zhFresh = [
     /(?:最新|即時)(?:消息|新聞|公告|版本)/i,
     /(?:今天|今日|現在|目前|剛剛|明天|明日|本週|這週|下週)\s*(?:的)?\s*(?:天氣|氣溫|降雨|新聞|消息|比賽|賽程|匯率|股價|行情)/i,
