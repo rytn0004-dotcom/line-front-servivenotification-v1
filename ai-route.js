@@ -8,6 +8,15 @@ function needsFreshWeb(text){
   const t=clean(text);
   if(!t)return false;
 
+  // 明確要求上網搜尋時直接啟用 grounding；一般「查資料」仍交由新鮮資訊規則判斷。
+  const explicitWebSearch=[
+    /(?:上網|網路|網上|網頁|Google).{0,16}(?:搜尋|搜索|查詢|查一下|查查看|找資料)/i,
+    /(?:搜尋|搜索|查詢|查一下|查查看|找資料).{0,16}(?:上網|網路|網上|網頁|Google|最新|即時|目前)/i,
+    /(?:幫我|請|麻煩).{0,10}(?:上網查|網路查|搜尋網路|搜尋網頁|網路搜尋|網上搜尋|Google一下)/i,
+    /\b(?:search|browse|look up|check online|google)\b/i,
+  ].some(re=>re.test(t));
+  if(explicitWebSearch)return true;
+
   const zhFresh = [
     /(?:最新|即時)(?:消息|新聞|公告|版本)/i,
     /(?:今天|今日|現在|目前|剛剛|明天|明日|本週|這週|下週)\s*(?:的)?\s*(?:天氣|氣溫|降雨|新聞|消息|比賽|賽程|匯率|股價|行情)/i,
