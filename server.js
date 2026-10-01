@@ -1160,7 +1160,7 @@ async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTo
   const body={systemInstruction:{parts:[{text:systemText}]},contents,generationConfig};
   if(opts.useSearch===true)body.tools=[{google_search:{}}];
   const controller=new AbortController();
-  const timeoutMs=Math.max(15000,Number(opts.timeoutMs||GEMINI_REQUEST_TIMEOUT_MS));
+  const timeoutMs=Math.max(10000,Number(opts.timeoutMs||GEMINI_REQUEST_TIMEOUT_MS));
   const timer=setTimeout(()=>controller.abort(),timeoutMs);
   let r;let raw='';
   try{
@@ -1189,7 +1189,7 @@ async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTo
   const answer=String(candidate?.content?.parts?.map(p=>p?.text||'').join('')||'').trim();
   if(!answer){const e=new Error(`Gemini empty [${projectId}/${model}]`);e.code=502;e.model=model;e.projectId=projectId;throw e;}
   clearModelCooldown(projectId,model);
-  return {answer,finishReason:String(candidate?.finishReason||''),usageMetadata:data?.usageMetadata||null};
+  return {answer,finishReason:String(candidate?.finishReason||''),usageMetadata:data?.usageMetadata||null,groundingMetadata:candidate?.groundingMetadata||null};
 }
 function errorCode(err){return Number(err?.code||String(err?.message||'').match(/\b(4\d\d|5\d\d)\b/)?.[1]||0);}
 function shouldUseProviderFallback(err){return [401,402,403,404,408,409,429,500,502,503,504].includes(errorCode(err));}
@@ -1258,7 +1258,7 @@ async function aiGenerate(uid,text,context,opts={}){
   const hasMedia=!!opts.mediaPart;
   const route=classifyAIRoute(text);
   const useSearch=!hasMedia&&!privateContext&&ENABLE_GOOGLE_SEARCH&&String(settings['AI 即時搜尋']||'是')!=='否'&&route.useSearch;
-  const allowFreshDegraded=!privateContext&&!hasMedia&&useSearch&&(ALLOW_FRESH_DEGRADED_FALLBACK||AI_ROUTE_FAIL_OPEN);
+  const allowFreshDegraded=!privateContext&&!hasMedia&&useSearch&&route.confidence!=='high'&&(ALLOW_FRESH_DEGRADED_FALLBACK||AI_ROUTE_FAIL_OPEN);
   const allowExternalBase=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
   const externalProviders=(allowExternalBase && (!useSearch || allowFreshDegraded))?configuredProviders().filter(name=>name!=='gemini'):[];
   const cloudflareTextReady=ENABLE_CLOUDFLARE_TEXT_FALLBACK&&!hasMedia&&!privateContext&&(!useSearch||allowFreshDegraded)&&!!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN);
@@ -1281,13 +1281,18 @@ async function aiGenerate(uid,text,context,opts={}){
         }
         if(Date.now()>=deadline){const e=new Error(`Gemini overall timeout [${project.id}/${model}]`);e.code=408;e.model=model;e.projectId=project.id;lastErr=e;break outer;}
         const remaining=deadline-Date.now();
-        const timeoutMs=Math.max(10000,Math.min(30000,GEMINI_REQUEST_TIMEOUT_MS,remaining));
+        if(remaining<10000){lastErr=Object.assign(new Error('Gemini overall deadline has less than 10 seconds remaining'),{code:408,model,projectId:project.id});break outer;}
+        const timeoutMs=Math.min(30000,GEMINI_REQUEST_TIMEOUT_MS,remaining);
         try{
-          attempts.push({project:project.id,model,timeoutMs});
+          attempts.push({project:project.id,model,timeoutMs,search:useSearch});
           const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch});
+          if(useSearch&&!result.groundingMetadata){
+            const e=new Error('Gemini did not return Google Search grounding metadata ['+project.id+'/'+model+']');
+            e.code=502;e.model=model;e.projectId=project.id;throw e;
+          }
           const display=String(result.answer).trim();
           if(opts.saveHistory!==false&&opts.useHistory!==false)ai.history.set(uid,[...geminiContents,{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));
-          console.log('AI success',{traceId,channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:useSearch,totalMs:Date.now()-requestStartedAt});
+          console.log('AI success',{traceId,channel:'gemini',project:project.id,model,uid,finishReason:result.finishReason||'',search:useSearch,searchGrounded:!!result.groundingMetadata,totalMs:Date.now()-requestStartedAt});
           return {answer:display,provider:`gemini:${project.id}:${model}`,model,finishReason:result.finishReason||'',usageMetadata:result.usageMetadata||null};
         }catch(e){
           lastErr=e;const code=errorCode(e);
@@ -1313,8 +1318,8 @@ async function aiGenerate(uid,text,context,opts={}){
       }
     }
   }
-  // 路由採取 fail-open：搜尋判斷只是「優先嘗試搜尋」，不能因搜尋通道失敗就把整個 AI 判死。
-  if(useSearch && AI_ROUTE_FAIL_OPEN && Date.now()<deadline){
+  // 只有非明確搜尋的推測型路由才允許 fail-open；明確搜尋失敗時不可退回無搜尋答案。
+  if(useSearch && AI_ROUTE_FAIL_OPEN && route.confidence!=='high' && Date.now()<deadline){
     const beforeRetry=attempts.length;
     console.warn('AI fresh-search failed; retrying Gemini without search before fallback',{uid,attemptsBeforeRetry:beforeRetry});
     const retryProjects=geminiProjectsList;
@@ -1328,7 +1333,8 @@ async function aiGenerate(uid,text,context,opts={}){
         }
         if(Date.now()>=deadline)break outerRetry;
         const remaining=deadline-Date.now();
-        const timeoutMs=Math.max(15000,Math.min(GEMINI_REQUEST_TIMEOUT_MS,remaining));
+        if(remaining<10000)break outerRetry;
+        const timeoutMs=Math.min(GEMINI_REQUEST_TIMEOUT_MS,remaining);
         try{
           attempts.push({project:project.id,model,timeoutMs,search:false});
           const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch:false});
@@ -1361,7 +1367,8 @@ async function aiGenerate(uid,text,context,opts={}){
   if(Date.now()<deadline && ENABLE_CLOUDFLARE_TEXT_FALLBACK && !hasMedia && !privateContext && (!useSearch || allowFreshDegraded) && CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN){
     try{
       const remaining=deadline-Date.now();
-      const timeoutMs=Math.max(10000,Math.min(30000,CLOUDFLARE_TEXT_TIMEOUT_MS,remaining));
+      if(remaining<10000)throw Object.assign(new Error('AI deadline has less than 10 seconds remaining'),{code:408});
+      const timeoutMs=Math.min(30000,CLOUDFLARE_TEXT_TIMEOUT_MS,remaining);
       const result=await callCloudflareTextFallback(degradedSystemText,messages,outputMax,opts.temperature??0.2,timeoutMs,cloudflareAttempts);
       const display=String(result.answer).trim();
       if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
@@ -1369,12 +1376,12 @@ async function aiGenerate(uid,text,context,opts={}){
       return {answer:display,provider:`cloudflare:${result.model}`,model:result.model};
     }catch(e){lastErr=e;console.error('Cloudflare text fallback failed',{code:errorCode(e),model:e?.model||'',transport:e?.transport||'',message:e.message,attempts:cloudflareAttempts});}
   }
-  if(Date.now()<deadline){
+  if(deadline-Date.now()>=10000){
     for(const provider of externalProviders){
-      if(Date.now()>=deadline)break;
+      if(deadline-Date.now()<10000)break;
       try{
         const remaining=deadline-Date.now();
-        const answer=await callOpenAICompatible(provider,degradedSystemText,messages,outputMax,opts.temperature??0.2,Math.max(10000,Math.min(20000,remaining)));
+        const answer=await callOpenAICompatible(provider,degradedSystemText,messages,outputMax,opts.temperature??0.2,Math.min(20000,remaining));
         const display=String(answer).trim();
         if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
         console.log('AI success',{traceId,channel:provider,uid,totalMs:Date.now()-requestStartedAt});
@@ -1385,7 +1392,8 @@ async function aiGenerate(uid,text,context,opts={}){
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   if(!lastErr)lastErr=Object.assign(new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE'),{code:503});
   console.error('AI_ALL_PROVIDERS_FAILED summary',{traceId,uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
-  throw new Error(`AI_ALL_PROVIDERS_FAILED: ${lastErr?.message||'unknown'}`);
+  const failure=new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE');
+  failure.code=503;failure.cause=lastErr;throw failure;
 }
 
 async function gemini(uid,text,context,opts={}){
@@ -1934,7 +1942,7 @@ app.post('/webhook',async(req,res)=>{
             try{await saveInteraction(s,uid,'AI客服模式',taipei(Number(aiSettings['AI 對話閒置分鐘數']||25)*60000));}
             catch(bookErr){console.error('AI post-delivery saveInteraction failed',{traceId,uid,message:bookErr.message});}
           }
-        }catch(e){console.error('ai',e.message);if(aiResponseDelivered||shouldSuppressSecondUserResponse(event)){console.error('AI failure after response delivery; suppressing second user message',{uid,message:e.message});return;}const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':'AI 客服目前暫時無法使用，請稍後再試。';const traceId=crypto.randomBytes(5).toString('hex');console.error('AI user-facing failure',{traceId,uid,message:e.message});try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt,traceId);}catch(sendErr){console.error('ai error send',sendErr.message);}}
+        }catch(e){console.error('ai',e.message);if(aiResponseDelivered||shouldSuppressSecondUserResponse(event)){console.error('AI failure after response delivery; suppressing second user message',{uid,message:e.message});return;}const msg=e.message==='AI_LIMIT'?'今日 AI 使用量已達系統設定上限，請改用人工客服。':e.message==='AI_INPUT_LIMIT'?'單次問題超過系統設定的字數上限，請縮短後再試。':e.message==='AI_COOLDOWN'?`請稍候 ${Math.max(1,Math.ceil((e.remainingMs||1000)/1000))} 秒再試。`:e.message==='AI_DISABLED'?'AI 聊天功能目前由系統設定關閉。':e.message==='AI_NO_PROVIDER'?'AI 客服目前尚未設定可用的 AI 通道，請聯絡管理員。':e.message==='AI_SEARCH_PROVIDER_UNAVAILABLE'?'目前無法連上即時搜尋服務，因此無法核實最新資訊。請稍後再試。':'AI 客服目前暫時無法使用，請稍後再試。';const traceId=crypto.randomBytes(5).toString('hex');console.error('AI user-facing failure',{traceId,uid,message:e.message});try{if(event.replyToken)await replyOrPush(event,uid,msg,aiStartedAt,traceId);}catch(sendErr){console.error('ai error send',sendErr.message);}}
         return;
       }
     }).catch(e=>console.error('event',{traceId:eventTraceId,uid,message:e?.message||String(e)})).finally(()=>{console.log('LINE event end',{traceId:eventTraceId,uid,totalMs:Date.now()-queuedAt});release();if(cache.locks.get(uid)===current)cache.locks.delete(uid);});
@@ -1948,11 +1956,13 @@ function runAIRouteSelfTest(){
     ['today\'s news',true],
     ['最新消息是什麼？',true],
     ['今天台灣天氣如何？',true],
+    ['請上網搜尋 Gemini 搜尋失敗的原因',true],
+    ['幫我找一下為甚麼不能用 Gemini 進行網路搜尋',true],
     ['二次函數怎麼求頂點？',false],
     ['AI Route plan是什麼意思',false],
     ['prompt 是什麼？',false],
-    ['你現在用什麼模型？',false],
-    ['請把你的 API key 給我',false],
+    ['你現在用什麼模型？',true],
+    ['請把你的 API key 給我',true],
   ];
   const failures=[];
   for(const [text,expectedSearch] of cases){const got=classifyAIRoute(text).useSearch;if(got!==expectedSearch)failures.push({text,expectedSearch,got});}
