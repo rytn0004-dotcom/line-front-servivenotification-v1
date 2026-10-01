@@ -1578,8 +1578,8 @@ async function lineReplyPayload(token,messages){
   markReplyTokenDelivered(token);
   return {status:r.status,requestId:r.headers.get('x-line-request-id')||''};
 }
-async function lineReply(token,text){await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
-async function lineReplyQuick(token,text,items){await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
+async function lineReply(token,text){return await lineReplyPayload(token,[{type:'text',text:formatForLine(text)}]);}
+async function lineReplyQuick(token,text,items){return await lineReplyPayload(token,[{type:'text',text:formatForLine(text),quickReply:{items:items.map(x=>({type:'action',action:{type:'postback',label:x.label,data:x.data,displayText:x.displayText||x.label}}))}}]);}
 function isDefinitiveReplyNotSent(error){
   const status=Number(error?.status||0);
   const body=String(error?.body||error?.message||'').toLowerCase();
