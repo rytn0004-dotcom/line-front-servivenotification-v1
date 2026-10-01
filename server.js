@@ -1179,9 +1179,24 @@ async function callGemini(projectId,apiKey,model,systemText,contents,maxOutputTo
     const retryDelayMatch=retryDelayText.match(/(\d+(?:\.\d+)?)s/i);
     if(retryDelayMatch)bodyRetryAfterMs=Math.round(Number(retryDelayMatch[1])*1000);
     const retryAfterMs=Math.max(retryAfterHeader>0?retryAfterHeader*1000:0,bodyRetryAfterMs);
-    const quotaExceeded=/(exceeded your current quota|quota.*exceed|requests per day|generateRequestsPerDayPerProjectPerModel|quota_metric|resource_exhausted)/i.test(raw);
-    const e=new Error(`Gemini ${r.status} [${projectId}/${model}]: ${raw.slice(0,500)}`);
-    e.code=r.status;e.model=model;e.projectId=projectId;e.retryAfterMs=retryAfterMs;e.isQuotaExceeded=quotaExceeded;
+    const quotaViolations=(parsedError?.details||[])
+      .filter(d=>/QuotaFailure/i.test(String(d?.['@type']||'')))
+      .flatMap(d=>Array.isArray(d?.violations)?d.violations:[]);
+    const quotaDiagnostics={
+      status:String(parsedError?.status||''),
+      message:String(parsedError?.message||''),
+      retryDelay:retryDelayText||null,
+      violations:quotaViolations.map(v=>({
+        quotaMetric:v?.quotaMetric||'',
+        quotaId:v?.quotaId||'',
+        quotaValue:v?.quotaValue||'',
+        quotaDimensions:v?.quotaDimensions||{},
+        description:v?.description||''
+      }))
+    };
+    const quotaExceeded=quotaViolations.length>0||/(exceeded your current quota|quota.*exceed|requests per day|generateRequestsPerDayPerProjectPerModel|quota_metric)/i.test(raw);
+    const e=new Error(`Gemini ${r.status} [${projectId}/${model}]: ${JSON.stringify(quotaDiagnostics)}`);
+    e.code=r.status;e.model=model;e.projectId=projectId;e.retryAfterMs=retryAfterMs;e.isQuotaExceeded=quotaExceeded;e.quotaDiagnostics=quotaDiagnostics;
     throw e;
   }
   let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Gemini invalid JSON [${projectId}/${model}]`);e.code=500;e.model=model;e.projectId=projectId;throw e;}
@@ -1300,10 +1315,10 @@ async function aiGenerate(uid,text,context,opts={}){
             const quotaExceeded=!!e.isQuotaExceeded;
             const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0,quotaExceeded);
             if(quotaExceeded){
-              skipped.push({scope:'model',project:project.id,model,reason:'quota-exceeded',remainingMs:duration});
-              console.warn('AI Gemini model quota exceeded; keeping other models/project available',{project:project.id,model,remainingMs:duration,next:'next-model'});
+              skipped.push({scope:'model',project:project.id,model,reason:'quota-exceeded',cooldownMs:duration});
+              console.warn('AI Gemini model quota exceeded; keeping other models/project available',{project:project.id,model,cooldownMs:duration,quotaDiagnostics:e.quotaDiagnostics||null,next:'next-model'});
             }else{
-              console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:false,retryAfterMs:e.retryAfterMs||0,cooldownMs:duration,next:'next-model'});
+              console.warn('AI Gemini quota/rate limit; trying next model',{project:project.id,model,quotaExceeded:false,retryAfterMs:e.retryAfterMs||0,cooldownMs:duration,quotaDiagnostics:e.quotaDiagnostics||null,next:'next-model'});
             }
           }else if([401,403].includes(code)){
             const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0);
@@ -1312,7 +1327,7 @@ async function aiGenerate(uid,text,context,opts={}){
             const duration=setModelCooldown(project.id,model,code,e.retryAfterMs||0);
             console.warn('AI Gemini transient failure; model cooldown applied',{project:project.id,model,code,cooldownMs:duration});
           }
-          console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message});
+          console.error('AI Gemini model failed',{project:project.id,model,code,message:e.message,quotaDiagnostics:e.quotaDiagnostics||null,retryAfterMs:e.retryAfterMs||0,isQuotaExceeded:!!e.isQuotaExceeded});
           if([401,403].includes(code))break;
         }
       }
@@ -1391,7 +1406,7 @@ async function aiGenerate(uid,text,context,opts={}){
   }
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   if(!lastErr)lastErr=Object.assign(new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE'),{code:503});
-  console.error('AI_ALL_PROVIDERS_FAILED summary',{traceId,uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
+  console.error('AI_ALL_PROVIDERS_FAILED summary',{traceId,uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',lastQuotaDiagnostics:lastErr?.quotaDiagnostics||null,attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
   const failure=new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE');
   failure.code=503;failure.cause=lastErr;throw failure;
 }
