@@ -1253,11 +1253,11 @@ async function aiGenerate(uid,text,context,opts={}){
   console.log('AI request start',{traceId,uid,mediaKind:mediaKind||'text',waitMs,outputMax});
   const quotaStartedAt=Date.now();
   const q=await reserveAIQuota(opts.snapshot||{},uid,opts.lineName||'',role,settings,text,{cost:opts.cost||1,mediaBytes:opts.mediaBytes||0,mediaKind:mediaKind});
-  const {systemText,geminiContents,messages}=buildAIRequest(text,context,{...opts,uid});
   const privateContext=!!opts.privateData;
   const hasMedia=!!opts.mediaPart;
   const route=classifyAIRoute(text);
   const useSearch=!hasMedia&&!privateContext&&ENABLE_GOOGLE_SEARCH&&String(settings['AI 即時搜尋']||'是')!=='否'&&route.useSearch;
+  const {systemText,geminiContents,messages}=buildAIRequest(text,context,{...opts,uid,useSearch});
   const allowFreshDegraded=!privateContext&&!hasMedia&&useSearch&&route.confidence!=='high'&&(ALLOW_FRESH_DEGRADED_FALLBACK||AI_ROUTE_FAIL_OPEN);
   const allowExternalBase=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
   const externalProviders=(allowExternalBase && (!useSearch || allowFreshDegraded))?configuredProviders().filter(name=>name!=='gemini'):[];
