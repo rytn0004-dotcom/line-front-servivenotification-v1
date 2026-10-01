@@ -8,12 +8,13 @@ function needsFreshWeb(text){
   const t=clean(text);
   if(!t)return false;
 
-  // 明確要求上網搜尋時直接啟用 grounding；一般「查資料」仍交由新鮮資訊規則判斷。
+  // 明確查找／搜尋意圖使用 Google Search grounding，不只依賴「今天、最新」等時間詞。
   const explicitWebSearch=[
-    /(?:上網|網路|網上|網頁|Google).{0,16}(?:搜尋|搜索|查詢|查一下|查查看|找資料)/i,
-    /(?:搜尋|搜索|查詢|查一下|查查看|找資料).{0,16}(?:上網|網路|網上|網頁|Google|最新|即時|目前)/i,
-    /(?:幫我|請|麻煩).{0,10}(?:上網查|網路查|搜尋網路|搜尋網頁|網路搜尋|網上搜尋|Google一下)/i,
-    /\b(?:search|browse|look up|check online|google)\b/i,
+    /(?:上網|網路|網上|網頁|Google).{0,24}(?:搜尋|搜索|查|找|查詢|確認|核實|比較)/i,
+    /(?:搜尋|搜索|查詢|查一下|查查看|查找|找一下|找資料|確認|核實|比較).{0,24}(?:上網|網路|網頁|Google|資料|資訊|最新|目前|支援|版本|功能|原因|價格|規定|消息|天氣)/i,
+    /(?:幫我|請|麻煩|可以幫我|想請你).{0,18}(?:查|搜尋|搜索|找|確認|核實|比較)(?:一下|看看|查看|查詢|資料)?/i,
+    /(?:Gemini|Google|ChatGPT|模型|API|版本|功能|服務).{0,24}(?:最新|目前|支援|限制|失敗|錯誤|變更|更新)/i,
+    /\b(?:search(?:\s+the\s+web)?|browse|look up|check online|find out|google)\b/i,
   ].some(re=>re.test(t));
   if(explicitWebSearch)return true;
 
@@ -41,7 +42,7 @@ function needsFreshWeb(text){
 function classifyAIRoute(text){
   const t=clean(text);
   if(!t)return {route:'general',useSearch:false,confidence:'none',reason:'empty'};
-  if(needsFreshWeb(t))return {route:'fresh-search',useSearch:true,confidence:'high',reason:'explicit-current-information'};
+  if(needsFreshWeb(t))return {route:'fresh-search',useSearch:true,confidence:'high',reason:'explicit-search-or-current-information'};
   return {route:'general',useSearch:false,confidence:'normal',reason:'no-high-confidence-current-signal'};
 }
 
