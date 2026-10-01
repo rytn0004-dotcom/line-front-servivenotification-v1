@@ -44,8 +44,8 @@ const GEMINI_MODEL_QUOTA_COOLDOWN_MS=Math.max(30000,Number(process.env.GEMINI_MO
 const GEMINI_503_COOLDOWN_MS=Math.max(5000,Number(process.env.GEMINI_503_COOLDOWN_MS||20000));
 // 單一 Gemini 模型最長等待 90 秒；整體等待仍由系統設定的「AI 一般最長等待秒數」控制。
 // Cloudflare 文字備援另外採用「容量忙碌立即拒絕」策略，避免把時間卡在容量佇列。
-const GEMINI_REQUEST_TIMEOUT_MS=Math.max(15000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||90000));
-const DEFAULT_AI_TEXT_WAIT_MS=180000;
+const GEMINI_REQUEST_TIMEOUT_MS=Math.max(10000,Math.min(30000,Number(process.env.GEMINI_REQUEST_TIMEOUT_MS||30000)));
+const DEFAULT_AI_TEXT_WAIT_MS=65000;
 const DEFAULT_AI_IMAGE_WAIT_MS=90000;
 const DEFAULT_AI_DOCUMENT_WAIT_MS=120000;
 const AI_REPLY_SAFE_WINDOW_MS=50000;
@@ -85,7 +85,7 @@ const CLOUDFLARE_TEXT_MODEL=String(process.env.CLOUDFLARE_TEXT_MODEL||'@cf/googl
 const CLOUDFLARE_TEXT_MODEL_ORDER=Array.from(new Set(String(process.env.CLOUDFLARE_TEXT_MODEL_ORDER||`${CLOUDFLARE_TEXT_MODEL},@cf/zai-org/glm-4.7-flash`).split(',').map(x=>x.trim()).filter(Boolean)));
 const CLOUDFLARE_TEXT_REJECT_IF_BUSY=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_REJECT_IF_BUSY||'true'));
 const CLOUDFLARE_TEXT_ENABLE_THINKING=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_ENABLE_THINKING||'false'));
-const CLOUDFLARE_TEXT_TIMEOUT_MS=Math.max(10000,Number(process.env.CLOUDFLARE_TEXT_TIMEOUT_MS||60000));
+const CLOUDFLARE_TEXT_TIMEOUT_MS=Math.max(10000,Math.min(30000,Number(process.env.CLOUDFLARE_TEXT_TIMEOUT_MS||30000)));
 const CLOUDFLARE_TEXT_OPENAI_FIRST=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_OPENAI_FIRST||'true'));
 const CLOUDFLARE_TEXT_EMPTY_COOLDOWN_MS=Math.max(5000,Number(process.env.CLOUDFLARE_TEXT_EMPTY_COOLDOWN_MS||30000));
 const ENABLE_CLOUDFLARE_TEXT_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.ENABLE_CLOUDFLARE_TEXT_FALLBACK||'true'));
@@ -1232,9 +1232,9 @@ async function releaseAIQuota(s,uid,usage={}){
 
 
 function aiWaitMsFor(kind,settings){
-  if(kind==='image')return Math.max(15000,aiSettingNum(settings,'AI 圖片最長等待秒數',90)*1000);
-  if(kind==='document')return Math.max(15000,aiSettingNum(settings,'AI 文件最長等待秒數',120)*1000);
-  return Math.max(180000,aiSettingNum(settings,'AI 一般最長等待秒數',aiSettingNum(settings,'AI 請求逾時秒數',180))*1000);
+  if(kind==='image')return Math.min(90000,Math.max(15000,aiSettingNum(settings,'AI 圖片最長等待秒數',90)*1000));
+  if(kind==='document')return Math.min(120000,Math.max(15000,aiSettingNum(settings,'AI 文件最長等待秒數',120)*1000));
+  return Math.min(DEFAULT_AI_TEXT_WAIT_MS,Math.max(15000,aiSettingNum(settings,'AI 一般最長等待秒數',65)*1000));
 }
 function outputTokensFor(kind,settings){
   if(kind==='image')return Math.max(200,aiSettingNum(settings,'AI 圖片回覆最大 Tokens',1000));
@@ -1281,7 +1281,7 @@ async function aiGenerate(uid,text,context,opts={}){
         }
         if(Date.now()>=deadline){const e=new Error(`Gemini overall timeout [${project.id}/${model}]`);e.code=408;e.model=model;e.projectId=project.id;lastErr=e;break outer;}
         const remaining=deadline-Date.now();
-        const timeoutMs=Math.max(15000,Math.min(GEMINI_REQUEST_TIMEOUT_MS,remaining));
+        const timeoutMs=Math.max(10000,Math.min(30000,GEMINI_REQUEST_TIMEOUT_MS,remaining));
         try{
           attempts.push({project:project.id,model,timeoutMs});
           const result=await callGemini(project.id,project.key,model,systemText,geminiContents,outputMax,opts.temperature??0.2,{timeoutMs,useSearch});
@@ -1361,7 +1361,7 @@ async function aiGenerate(uid,text,context,opts={}){
   if(Date.now()<deadline && ENABLE_CLOUDFLARE_TEXT_FALLBACK && !hasMedia && !privateContext && (!useSearch || allowFreshDegraded) && CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN){
     try{
       const remaining=deadline-Date.now();
-      const timeoutMs=Math.max(15000,Math.min(CLOUDFLARE_TEXT_TIMEOUT_MS,remaining));
+      const timeoutMs=Math.max(10000,Math.min(30000,CLOUDFLARE_TEXT_TIMEOUT_MS,remaining));
       const result=await callCloudflareTextFallback(degradedSystemText,messages,outputMax,opts.temperature??0.2,timeoutMs,cloudflareAttempts);
       const display=String(result.answer).trim();
       if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
@@ -1374,7 +1374,7 @@ async function aiGenerate(uid,text,context,opts={}){
       if(Date.now()>=deadline)break;
       try{
         const remaining=deadline-Date.now();
-        const answer=await callOpenAICompatible(provider,degradedSystemText,messages,outputMax,opts.temperature??0.2,Math.max(10000,Math.min(30000,remaining)));
+        const answer=await callOpenAICompatible(provider,degradedSystemText,messages,outputMax,opts.temperature??0.2,Math.max(10000,Math.min(20000,remaining)));
         const display=String(answer).trim();
         if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
         console.log('AI success',{traceId,channel:provider,uid,totalMs:Date.now()-requestStartedAt});
