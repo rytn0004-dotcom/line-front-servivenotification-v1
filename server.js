@@ -81,6 +81,9 @@ const CLOUDFLARE_API_TOKEN=String(process.env.CLOUDFLARE_API_TOKEN||'').trim();
 const GENERATED_IMAGE_PUBLIC_BASE=String(process.env.PUBLIC_BASE_URL||process.env.RENDER_EXTERNAL_URL||'').trim().replace(/\/$/,'');
 const BINDING_GUIDE_PUBLIC_URL=GENERATED_IMAGE_PUBLIC_BASE?`${GENERATED_IMAGE_PUBLIC_BASE}/binding-guide.png`:'';
 const ENABLE_BINDING_GUIDE_IMAGE=/^(1|true|yes|是)$/i.test(String(process.env.ENABLE_BINDING_GUIDE_IMAGE||'false'));
+const CLOUDFLARE_AI_GATEWAY_ID=String(process.env.CLOUDFLARE_AI_GATEWAY_ID||'default').trim();
+const CLOUDFLARE_GATEWAY_SEARCH_MODEL=String(process.env.CLOUDFLARE_GATEWAY_SEARCH_MODEL||'openai/gpt-4o-mini').trim();
+const ENABLE_CLOUDFLARE_GATEWAY_SEARCH_FALLBACK=/^(1|true|yes|是)$/i.test(String(process.env.AI_CLOUDFLARE_GATEWAY_SEARCH_FALLBACK||'true'));
 const CLOUDFLARE_TEXT_MODEL=String(process.env.CLOUDFLARE_TEXT_MODEL||'@cf/google/gemma-4-26b-a4b-it').trim();
 const CLOUDFLARE_TEXT_MODEL_ORDER=Array.from(new Set(String(process.env.CLOUDFLARE_TEXT_MODEL_ORDER||`${CLOUDFLARE_TEXT_MODEL},@cf/zai-org/glm-4.7-flash`).split(',').map(x=>x.trim()).filter(Boolean)));
 const CLOUDFLARE_TEXT_REJECT_IF_BUSY=/^(1|true|yes|是)$/i.test(String(process.env.CLOUDFLARE_TEXT_REJECT_IF_BUSY||'true'));
@@ -582,6 +585,54 @@ async function callCloudflareTextFallback(systemText,messages,maxTokens,temperat
     }
   }
   throw lastErr||Object.assign(new Error('Cloudflare text failed'),{code:502});
+}
+function extractCloudflareGatewaySearchResponse(data){
+  const output=Array.isArray(data?.output)?data.output:[];
+  const searchUsed=output.some(item=>item?.type==='web_search_call');
+  const sources=[];const seen=new Set();const answerParts=[];
+  for(const item of output){
+    if(item?.type!=='message'||!Array.isArray(item.content))continue;
+    for(const part of item.content){
+      if(part?.type==='output_text'&&typeof part.text==='string'&&part.text.trim())answerParts.push(part.text.trim());
+      for(const annotation of Array.isArray(part?.annotations)?part.annotations:[]){
+        if(annotation?.type!=='url_citation'||!/^https?:\/\//i.test(String(annotation.url||'')))continue;
+        const url=String(annotation.url).trim();
+        if(seen.has(url))continue;
+        seen.add(url);sources.push({title:String(annotation.title||url).trim(),url});
+      }
+    }
+  }
+  const answer=String(data?.output_text||answerParts.join('\n').trim()).trim();
+  return {answer,searchUsed,sources:sources.slice(0,4)};
+}
+async function callCloudflareGatewaySearch(systemText,messages,maxTokens,timeoutMs=30000){
+  if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN)throw Object.assign(new Error('CLOUDFLARE_GATEWAY_SEARCH_NOT_CONFIGURED'),{code:503});
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),Math.max(10000,Number(timeoutMs||30000)));
+  try{
+    const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/responses`;
+    const input=[{role:'system',content:systemText},...messages.map(m=>({role:m.role==='assistant'?'assistant':'user',content:String(m.content||'')}))];
+    const body={model:CLOUDFLARE_GATEWAY_SEARCH_MODEL,input,tools:[{type:'web_search_preview'}],tool_choice:'required',max_output_tokens:Math.max(64,Number(maxTokens||500)),store:false};
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`,'cf-aig-gateway-id':CLOUDFLARE_AI_GATEWAY_ID},body:JSON.stringify(body),signal:controller.signal});
+    const raw=await r.text();let data=null;try{data=JSON.parse(raw);}catch{}
+    if(!r.ok){
+      const info=data?.error||data?.errors?.[0]||{};
+      const err=new Error(`Cloudflare AI Gateway search ${r.status}: ${String(info.message||info.code||raw.slice(0,240))}`);
+      err.code=r.status;err.provider='cloudflare-ai-gateway-search';err.model=CLOUDFLARE_GATEWAY_SEARCH_MODEL;throw err;
+    }
+    if(!data||typeof data!=='object'){
+      const err=new Error('Cloudflare AI Gateway search invalid JSON');err.code=502;err.provider='cloudflare-ai-gateway-search';throw err;
+    }
+    const parsed=extractCloudflareGatewaySearchResponse(data);
+    if(!parsed.answer||!parsed.searchUsed||!parsed.sources.length){
+      const err=new Error('Cloudflare AI Gateway search returned no grounded answer/citations');err.code=502;err.provider='cloudflare-ai-gateway-search';err.model=CLOUDFLARE_GATEWAY_SEARCH_MODEL;
+      err.providerDetails={searchUsed:parsed.searchUsed,answerLength:parsed.answer.length,sourceCount:parsed.sources.length,outputTypes:Array.isArray(data.output)?data.output.map(x=>String(x?.type||'')).slice(0,12):[]};
+      throw err;
+    }
+    return {...parsed,model:CLOUDFLARE_GATEWAY_SEARCH_MODEL};
+  }catch(e){
+    if(e?.name==='AbortError'){const err=new Error('Cloudflare AI Gateway search timeout');err.code=408;err.provider='cloudflare-ai-gateway-search';err.model=CLOUDFLARE_GATEWAY_SEARCH_MODEL;throw err;}
+    throw e;
+  }finally{clearTimeout(timer);}
 }
 async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GEN_MAX_WAIT_MS){
   if(!CLOUDFLARE_ACCOUNT_ID||!CLOUDFLARE_API_TOKEN)throw new Error('IMAGE_PROVIDER_NOT_CONFIGURED');
@@ -1097,7 +1148,12 @@ function cloudflareTextResponseDiagnostics(data){
     const text=textFromContent(value).trim();
     if(text)lengths[name]=text.length;
   }
-  return {success:data?.success,topKeys,resultType,resultKeys,textLengths:lengths,errorCount:Array.isArray(data?.errors)?data.errors.length:0,messageCount:Array.isArray(data?.messages)?data.messages.length:0};
+  const choice=data?.choices?.[0]||result?.choices?.[0]||null;
+  const message=choice?.message||null;
+  const content=message?.content??choice?.text??null;
+  const contentType=Array.isArray(content)?'array':typeof content;
+  const contentLength=typeof content==='string'?content.length:Array.isArray(content)?textFromContent(content).length:0;
+  return {success:data?.success,topKeys,resultType,resultKeys,textLengths:lengths,choiceCount:Array.isArray(data?.choices)?data.choices.length:Array.isArray(result?.choices)?result.choices.length:0,choiceKeys:choice?Object.keys(choice).slice(0,16):[],messageKeys:message?Object.keys(message).slice(0,24):[],contentType,contentLength,finishReason:choice?.finish_reason||choice?.finishReason||'',refusalLength:typeof message?.refusal==='string'?message.refusal.length:0,toolCallCount:Array.isArray(message?.tool_calls)?message.tool_calls.length:0,errorCount:Array.isArray(data?.errors)?data.errors.length:0,messageCount:Array.isArray(data?.messages)?data.messages.length:0};
 }
 function extractCloudflareTextAnswer(data){
   const candidates=[
@@ -1277,12 +1333,14 @@ async function aiGenerate(uid,text,context,opts={}){
   const allowExternalBase=!(privateContext&&!ALLOW_PRIVATE_AI_FALLBACK) && !hasMedia;
   const externalProviders=(allowExternalBase && (!useSearch || allowFreshDegraded))?configuredProviders().filter(name=>name!=='gemini'):[];
   const cloudflareTextReady=ENABLE_CLOUDFLARE_TEXT_FALLBACK&&!hasMedia&&!privateContext&&(!useSearch||allowFreshDegraded)&&!!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN);
-  console.log('AI route plan',{uid,route:route.route,routeConfidence:route.confidence,routeReason:route.reason,useSearch,allowFreshDegraded,privateContext,hasMedia,geminiProjects:geminiProjects().map(x=>({slot:x.id,projectId:x.projectId||'not-set'})),cooldownScope:'model-only',projectCooldownDisabled:true,cloudflareTextReady,externalProviders,routeFailOpen:AI_ROUTE_FAIL_OPEN,cloudflareOpenAITransport:AI_CLOUDFLARE_OPENAI_FALLBACK,quotaReserveMs:Date.now()-quotaStartedAt});
-  if(geminiProjects().length===0&&externalProviders.length===0&&!cloudflareTextReady){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
+  const cloudflareGatewaySearchReady=ENABLE_CLOUDFLARE_GATEWAY_SEARCH_FALLBACK&&useSearch&&!hasMedia&&!privateContext&&!!(CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN);
+  console.log('AI route plan',{uid,route:route.route,routeConfidence:route.confidence,routeReason:route.reason,useSearch,allowFreshDegraded,privateContext,hasMedia,geminiProjects:geminiProjects().map(x=>({slot:x.id,projectId:x.projectId||'not-set'})),cooldownScope:'model-only',projectCooldownDisabled:true,cloudflareTextReady,cloudflareGatewaySearchReady,cloudflareGatewaySearchModel:cloudflareGatewaySearchReady?CLOUDFLARE_GATEWAY_SEARCH_MODEL:'',externalProviders,routeFailOpen:AI_ROUTE_FAIL_OPEN,cloudflareOpenAITransport:AI_CLOUDFLARE_OPENAI_FALLBACK,quotaReserveMs:Date.now()-quotaStartedAt});
+  if(geminiProjects().length===0&&externalProviders.length===0&&!cloudflareTextReady&&!cloudflareGatewaySearchReady){await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});throw new Error('AI_NO_PROVIDER');}
   let lastErr=null;
   const attempts=[];
   const skipped=[];
   const cloudflareAttempts=[];
+  const cloudflareGatewaySearchAttempts=[];
   const geminiProjectsList=geminiProjects();
   if(geminiProjectsList.length){
     outer: for(const project of geminiProjectsList){
@@ -1331,6 +1389,28 @@ async function aiGenerate(uid,text,context,opts={}){
           if([401,403].includes(code))break;
         }
       }
+    }
+  }
+  if(useSearch&&ENABLE_CLOUDFLARE_GATEWAY_SEARCH_FALLBACK&&!hasMedia&&!privateContext&&CLOUDFLARE_ACCOUNT_ID&&CLOUDFLARE_API_TOKEN){
+    const remaining=deadline-Date.now();
+    if(remaining>=10000){
+      try{
+        const timeoutMs=Math.min(30000,remaining);
+        const searchSystemText=systemText+'\n\n請使用 web_search_preview 即時搜尋這個問題，只依搜尋結果作答，並保留可核對的來源。';
+        const result=await callCloudflareGatewaySearch(searchSystemText,messages,outputMax,timeoutMs);
+        const sourceText=result.sources.map((source,index)=>`${index+1}. ${source.title} ${source.url}`).join('\n');
+        const display=`${result.answer}\n\n資料來源：\n${sourceText}`.trim();
+        if(opts.saveHistory!==false&&opts.useHistory!==false){const historyBase=aiHistory(uid);ai.history.set(uid,[...historyBase,{role:'user',parts:[{text:String(text||'')}]},{role:'model',parts:[{text:display}]}].slice(-AI_MAX_HISTORY_TURNS*2));}
+        cloudflareGatewaySearchAttempts.push({model:result.model,status:200,ok:true,sourceCount:result.sources.length});
+        console.log('AI success',{traceId,channel:'cloudflare-ai-gateway-web-search',model:result.model,uid,search:true,searchGrounded:true,sourceCount:result.sources.length,totalMs:Date.now()-requestStartedAt});
+        return {answer:display,provider:`cloudflare-ai-gateway-search:${result.model}`,model:result.model,searchGrounded:true,sources:result.sources};
+      }catch(e){
+        lastErr=e;
+        cloudflareGatewaySearchAttempts.push({model:e?.model||CLOUDFLARE_GATEWAY_SEARCH_MODEL,status:errorCode(e),ok:false,providerDetails:e?.providerDetails||null});
+        console.error('Cloudflare AI Gateway search fallback failed',{code:errorCode(e),model:e?.model||CLOUDFLARE_GATEWAY_SEARCH_MODEL,message:e.message,providerDetails:e?.providerDetails||null});
+      }
+    }else{
+      cloudflareGatewaySearchAttempts.push({model:CLOUDFLARE_GATEWAY_SEARCH_MODEL,status:408,ok:false,reason:'less-than-10-seconds-remain'});
     }
   }
   // 只有非明確搜尋的推測型路由才允許 fail-open；明確搜尋失敗時不可退回無搜尋答案。
@@ -1406,7 +1486,7 @@ async function aiGenerate(uid,text,context,opts={}){
   }
   await releaseAIQuota(opts.snapshot||{},uid,{cost:q.cost,mediaBytes:q.mediaBytes});
   if(!lastErr)lastErr=Object.assign(new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE'),{code:503});
-  console.error('AI_ALL_PROVIDERS_FAILED summary',{traceId,uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',lastQuotaDiagnostics:lastErr?.quotaDiagnostics||null,attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
+  console.error('AI_ALL_PROVIDERS_FAILED summary',{traceId,uid,route:route.route,routeConfidence:route.confidence,useSearch,allowFreshDegraded,totalMs:Date.now()-requestStartedAt,lastCode:errorCode(lastErr),lastProject:lastErr?.projectId||'',lastModel:lastErr?.model||'',lastTransport:lastErr?.transport||'',lastMessage:lastErr?.message||'unknown',lastQuotaDiagnostics:lastErr?.quotaDiagnostics||null,attemptCount:attempts.length,skippedCount:skipped.length,cloudflareAttemptCount:cloudflareAttempts.length,cloudflareGatewaySearchAttempts,attempts:attempts.map(a=>`${a.project}:${a.model}:${a.timeoutMs}${a.search===false?':no-search':''}`),skipped,cloudflareAttempts});
   const failure=new Error(useSearch?'AI_SEARCH_PROVIDER_UNAVAILABLE':'AI_PROVIDERS_TEMPORARILY_UNAVAILABLE');
   failure.code=503;failure.cause=lastErr;throw failure;
 }
