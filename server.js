@@ -1844,7 +1844,7 @@ app.post('/webhook',async(req,res)=>{
       }
       if(text===kw||text==='功能選單'){
         await saveInteraction(s,uid,'互動模式',taipei(minutes*60000));
-        const menuText=`您好，請選擇您要使用的功能：(請先完成line綁定，再進行其他查詢)\n\n（目前測試開放：① ④ ⑥）\n① LINE綁定\n② 課程查詢（目前尚未開放）\n③ 繳費／收據（目前尚未開放）\n④ AI客服\n⑤ 人工客服（目前尚未開放）\n⑥ 圖片製作\n輸入「取消」可離開互動模式。 ※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;
+        const menuText=`您好，請選擇您要使用的功能：(請先完成line綁定，再進行其他查詢)\n\n（目前開放：① ② ④ ⑥）\n① LINE綁定\n② 課程查詢\n③ 繳費／收據（目前尚未開放）\n④ AI客服\n⑤ 人工客服（目前尚未開放）\n⑥ 圖片製作\n輸入「取消」可離開互動模式。 ※ 主機喚醒可能有短暫延遲；若未收到回覆，可在一分鐘後再輸入「選單」。`;
         const b=findBinding(s,uid), c=contactByUid(s,uid), isBound=!!(b&&b.status==='BOUND')||c?.status==='已綁定';
         if(event.replyToken && ENABLE_BINDING_GUIDE_IMAGE && !isBound && BINDING_GUIDE_PUBLIC_URL){
           try{
@@ -1895,7 +1895,6 @@ app.post('/webhook',async(req,res)=>{
         if(event.replyToken)await lineReply(event.replyToken,`您已完成 LINE 綁定。\n\n${bindingSummary(b.data)}\n\n課表查詢權限：${c?.permission==='是'?'已開啟':'尚未開啟'}\n\n剛完成綁定時，${BIND_GRACE_MINUTES} 分鐘內可用「更正綁定」修正一次。`);return;
       }
       if(text==='2'||text==='課程查詢'){
-        if(event.replyToken){await lineReply(event.replyToken,'目前家長測試暫未開放「② 課程查詢」，本次測試請先使用① LINE綁定、④ AI客服、⑥ 圖片製作。');}return;
         const aiIdle=Number(sm['AI 對話閒置分鐘數']||25)||25;
         const c=contactByUid(s,uid);if(!c||c.status!=='已綁定'){if(event.replyToken)await lineReply(event.replyToken,'課程查詢需要先完成 LINE 綁定。');return;}if(c.permission!=='是'){if(event.replyToken)await lineReply(event.replyToken,'您的課表查詢權限尚未開啟。綁定已完成，但需管理員在後台確認後才能查詢。');return;}if(geminiProjects().length===0&&configuredProviders().length===0){if(event.replyToken)await lineReply(event.replyToken,'課程查詢 AI 尚未設定，請使用人工客服。');return;}await saveInteraction(s,uid,'AI課程查詢模式',taipei(aiIdle*60000));clearHistory(uid);if(event.replyToken)await lineReply(event.replyToken,'已進入課程查詢。\n\n例如：「我小孩星期六幾點上課？」\n\n系統只會使用您已授權的課程資料。');return;
       }
