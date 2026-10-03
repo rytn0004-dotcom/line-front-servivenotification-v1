@@ -68,7 +68,7 @@ const DEFAULT_MAX_GLOBAL_MEDIA_MB=300;
 const DEFAULT_MEDIA_CONCURRENCY=1;
 const MEDIA_TYPES=new Set(['image/jpeg','image/png','image/webp','image/heic','image/heif']);
 const DOCUMENT_TYPES=new Set(['application/pdf']);
-const IMAGE_GEN_DEFAULT_MODEL='@cf/black-forest-labs/flux-1-schnell';
+const IMAGE_GEN_DEFAULT_MODEL='@cf/black-forest-labs/flux-2-klein-9b';
 const DEFAULT_IMAGE_GEN_DAILY_USER_LIMIT=2;
 const DEFAULT_IMAGE_GEN_DAILY_GLOBAL_LIMIT=20;
 const DEFAULT_IMAGE_GEN_STEPS=4;
@@ -642,7 +642,19 @@ async function callCloudflareImage(prompt,model,steps,timeoutMs=DEFAULT_IMAGE_GE
   try{
     const encodedModel=String(model).split('/').map(x=>encodeURIComponent(x)).join('/');
     const url=`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/run/${encodedModel}`;
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
+    const isFlux2Klein9B=String(model).trim()==='@cf/black-forest-labs/flux-2-klein-9b';
+    let r;
+    if(isFlux2Klein9B){
+      // FLUX.2 Klein 9B 使用 multipart/form-data；steps 固定為 4，不能由 API 調整。
+      // 先維持 1024x1024，方便這次與舊圖片生成結果直接比較。
+      const form=new FormData();
+      form.append('prompt',String(prompt||''));
+      form.append('width','1024');
+      form.append('height','1024');
+      r=await fetch(url,{method:'POST',headers:{Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`},body:form,signal:controller.signal});
+    }else{
+      r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${CLOUDFLARE_API_TOKEN}`},body:JSON.stringify({prompt,steps}),signal:controller.signal});
+    }
     const raw=await r.text();
     const requestId=r.headers.get('cf-ray')||r.headers.get('cf-request-id')||'';
     if(!r.ok){
