@@ -2,13 +2,16 @@ name: Render客服 Keep Alive
 
 on:
   # GitHub Actions scheduled workflows use the timezone below.
-  # 12:57 Taipei: pre-warm the Render service before the 13:00 service window.
-  # 13:02–22:57 Taipei: ping every 5 minutes so Render receives inbound traffic
-  # well before its 15-minute free-tier idle shutdown threshold.
+  # Sunday–Friday: 12:57 Taipei pre-warm, then ping every 5 minutes from 13:02 to 22:57.
+  # Saturday: 06:57 Taipei pre-warm, then ping every 5 minutes from 07:02 to 18:57.
   schedule:
-    - cron: '57 12 * * *'
+    - cron: '57 12 * * 0-5'
       timezone: 'Asia/Taipei'
-    - cron: '2-59/5 13-22 * * *'
+    - cron: '2-59/5 13-22 * * 0-5'
+      timezone: 'Asia/Taipei'
+    - cron: '57 6 * * 6'
+      timezone: 'Asia/Taipei'
+    - cron: '2-59/5 7-18 * * 6'
       timezone: 'Asia/Taipei'
   workflow_dispatch:
 
