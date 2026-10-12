@@ -1,26 +1,11 @@
-name: Render客服 Keep Alive
+name: Render客服 Keep Alive（舊版手動測試）
 
 on:
-  # Validate the workflow whenever this file itself changes.
-  push:
-    paths:
-      - '.github/workflows/render-keep-alive.yml'
-  # GitHub scheduled workflows can be delayed; avoid minute 0 and use an 8-minute cadence.
-  # Sunday–Friday: 12:57 Taipei pre-warm, then run around every 8 minutes from 13:03 to 22:59.
-  # Saturday: 06:57 Taipei pre-warm, then run around every 8 minutes from 07:03 to 18:59.
-  schedule:
-    - cron: '57 12 * * 0-5'
-      timezone: 'Asia/Taipei'
-    - cron: '3-59/8 13-22 * * 0-5'
-      timezone: 'Asia/Taipei'
-    - cron: '57 6 * * 6'
-      timezone: 'Asia/Taipei'
-    - cron: '3-59/8 7-18 * * 6'
-      timezone: 'Asia/Taipei'
+  # Keep manual testing available; scheduled checks are handled by render-health-ping.yml.
   workflow_dispatch:
 
 concurrency:
-  group: render-customer-service-keepalive
+  group: render-customer-service-keepalive-manual
   cancel-in-progress: true
 
 jobs:
