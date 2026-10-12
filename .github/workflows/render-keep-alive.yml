@@ -1,6 +1,10 @@
 name: Render客服 Keep Alive
 
 on:
+  # Validate the workflow whenever this file itself changes.
+  push:
+    paths:
+      - '.github/workflows/render-keep-alive.yml'
   # GitHub scheduled workflows can be delayed; avoid minute 0 and use an 8-minute cadence.
   # Sunday–Friday: 12:57 Taipei pre-warm, then run around every 8 minutes from 13:03 to 22:59.
   # Saturday: 06:57 Taipei pre-warm, then run around every 8 minutes from 07:03 to 18:59.
