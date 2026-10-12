@@ -1,0 +1,55 @@
+name: Render健康檢查 Keep Alive
+
+on:
+  # This dedicated workflow checks Render directly via the configured /health URL.
+  # Sunday–Friday: pre-warm at 12:57 Taipei, then ping every 10 minutes from 13:05 to 22:55.
+  # Saturday: pre-warm at 06:57 Taipei, then ping every 10 minutes from 07:05 to 18:55.
+  # A push trigger runs one validation when this workflow file is first added/changed.
+  push:
+    paths:
+      - '.github/workflows/render-health-ping.yml'
+  schedule:
+    - cron: '57 12 * * 0-5'
+      timezone: 'Asia/Taipei'
+    - cron: '5,15,25,35,45,55 13-22 * * 0-5'
+      timezone: 'Asia/Taipei'
+    - cron: '57 6 * * 6'
+      timezone: 'Asia/Taipei'
+    - cron: '5,15,25,35,45,55 7-18 * * 6'
+      timezone: 'Asia/Taipei'
+  workflow_dispatch:
+
+concurrency:
+  group: render-health-ping
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    env:
+      RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "${RENDER_HEALTH_URL:-}" ]; then
+            echo "Missing GitHub Actions repository variable: RENDER_HEALTH_URL"
+            echo "Set it to your Render service health endpoint, for example https://your-service.onrender.com/health"
+            exit 1
+          fi
+
+      - name: Keep Render service warm
+        run: |
+          echo "Taipei time: $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Pinging ${RENDER_HEALTH_URL}"
+          curl --fail --silent --show-error \
+            --location \
+            --connect-timeout 10 \
+            --max-time 20 \
+            --retry 2 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -H 'User-Agent: GitHubActions-Render-Health-Ping/1.0' \
+            "${RENDER_HEALTH_URL}"
+          echo
+          echo "Render health check succeeded."
